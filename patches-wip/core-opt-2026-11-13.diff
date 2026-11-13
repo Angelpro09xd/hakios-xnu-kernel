@@ -1,0 +1,381 @@
+diff --git a/hakios-metal/include/hakios-metal/command.hpp b/hakios-metal/include/hakios-metal/command.hpp
+index 1ab2416..68c7c05 100644
+--- a/hakios-metal/include/hakios-metal/command.hpp
++++ b/hakios-metal/include/hakios-metal/command.hpp
+@@ -254,24 +254,40 @@ public:
+         RegShadow(const RegShadow&) = delete;
+         RegShadow& operator=(const RegShadow&) = delete;
+         // whether REG held VALUE; it holds VALUE from now on
++        // (sapphire) by blocks of 64 registers, a block given to a page of the register file the first time one of its
++        // registers is written and kept for it: a pass touches some 40 pages, 20 KB, where the flat table of 65536 slots
++        // (512 KB) missed the caches on most lookups -- a quarter of a draw's time on the phone
+         bool hold(uint32_t reg, uint32_t value) {
+             if (reg >= kRegs) return false;
+-            Slot& s = table_->slots[reg];
+-            const bool same = s.gen == table_->gen && s.value == value;
+-            s.value = value;
+-            s.gen = table_->gen;
++            Block*& bp = table_->pages[reg >> 6];
++            if (bp == nullptr) {
++                if (table_->used >= kBlocks) return false;   // (out of blocks: never "same", nothing kept)
++                bp = &table_->blocks[table_->used++];
++                bp->gen = 0;
++            }
++            Block& blk = *bp;
++            if (blk.gen != table_->gen) {
++                blk.gen = table_->gen;
++                blk.mask = 0;
++            }
++            const uint32_t i = reg & 63;
++            const uint64_t bit = uint64_t(1) << i;
++            const bool same = (blk.mask & bit) != 0 && blk.values[i] == value;
++            blk.values[i] = value;
++            blk.mask |= bit;
+             return same;
+         }
+         void clear() {
+-            if (++table_->gen == 0) {   // (after 4 billion clears: every slot old again)
+-                for (uint32_t i = 0; i < kRegs; i++) table_->slots[i].gen = 0;
++            if (++table_->gen == 0) {   // (after 4 billion clears: every block old again)
++                for (uint32_t i = 0; i < table_->used; i++) table_->blocks[i].gen = 0;
+                 table_->gen = 1;
+             }
+         }
+     private:
+         static constexpr uint32_t kRegs = 0x10000;
+-        struct Slot { uint32_t value, gen; };
+-        struct Table { Slot slots[kRegs]; uint32_t gen; };
++        static constexpr uint32_t kBlocks = 256;
++        struct Block { uint32_t gen; uint32_t pad; uint64_t mask; uint32_t values[64]; };
++        struct Table { Block* pages[kRegs / 64]; Block blocks[kBlocks]; uint32_t used; uint32_t gen; };
+         static std::mutex& poolLock() { static std::mutex m; return m; }
+         static std::vector<Table*>& pool() { static std::vector<Table*> p; return p; }
+         static Table* take() {
+@@ -284,10 +300,10 @@ public:
+                 }
+             }
+             if (t == nullptr) {
+-                t = new Table();
++                t = new Table();   // (value-initialised: no pages, no blocks used)
+                 t->gen = 1;
+             } else if (++t->gen == 0) {
+-                for (uint32_t i = 0; i < kRegs; i++) t->slots[i].gen = 0;
++                for (uint32_t i = 0; i < t->used; i++) t->blocks[i].gen = 0;
+                 t->gen = 1;
+             }
+             return t;
+diff --git a/hakios-metal/src/c_api.cpp b/hakios-metal/src/c_api.cpp
+index 102edd4..edcb11c 100644
+--- a/hakios-metal/src/c_api.cpp
++++ b/hakios-metal/src/c_api.cpp
+@@ -1,3 +1,5 @@
++#include <pthread.h>
++#include <sched.h>
+ #include <atomic>
+ #include <condition_variable>
+ #include <deque>
+@@ -27,6 +29,26 @@
+ 
+ using namespace hakios::metal;
+ 
++
++namespace {
++// (sapphire) whether /var/tmp/metal.args asks for the driver's threads at fixed priority 54 (metal_rr54): off by default
++// since the phone froze with it on (13 November), to be tried alone
++inline bool hmRr54Wanted() {
++    static int on = -1;
++    if (on < 0) {
++        on = 0;
++        if (FILE* f = std::fopen("/var/tmp/metal.args", "r")) {
++            char b[1024] = "";
++            size_t n = std::fread(b, 1, sizeof b - 1, f);
++            b[n] = 0;
++            std::fclose(f);
++            on = std::strstr(b, "metal_rr54") != nullptr;
++        }
++    }
++    return on == 1;
++}
++}  // namespace
++
+ namespace {
+ thread_local std::string lastError;
+ 
+@@ -54,6 +76,24 @@ public:
+         thread_.join();
+     }
+     void post(std::atomic<int>* pending, std::function<void()> f) {
++        // (sapphire) the recorder runs at the poster's scheduling: CoreAnimation's render thread is fixed priority 54,
++        // above the applications' 47, and a recorder left at the default 31 was put off by any of them mid-frame (the
++        // uneven frames that kept metal_defer off)
++        // (each posting thread looked at once; the highest priority seen wins)
++        static thread_local bool looked = false;
++        if (!looked) {
++            looked = true;
++            int policy = 0;
++            sched_param param{};
++            if (pthread_getschedparam(pthread_self(), &policy, &param) == 0) {
++                std::lock_guard<std::mutex> g(m_);
++                if (param.sched_priority > prioParam_.sched_priority) {
++                    prioPolicy_ = policy;
++                    prioParam_ = param;
++                    prioWanted_.store(true);
++                }
++            }
++        }
+         pending->fetch_add(1);
+         {
+             std::lock_guard<std::mutex> g(m_);
+@@ -85,6 +125,21 @@ private:
+             Job j = std::move(q_.front());
+             q_.pop_front();
+             busy_ = true;
++            if (prioWanted_.exchange(false)) {
++                pthread_setschedparam(pthread_self(), prioPolicy_, &prioParam_);   // (under m_: read with the lock held)
++            }
++#ifdef __APPLE__
++            // (sapphire) on iOS pthread_getschedparam does not see the fixed priority CoreAnimation gives its render
++            // thread through Mach (round robin, 54): the recorder takes that one itself, once
++            if (!rrSet_ && hmRr54Wanted()) {
++                rrSet_ = true;
++                sched_param rr{};
++                rr.sched_priority = 54;
++                pthread_setname_np("hakios-metal.deferred");
++                const int e = pthread_setschedparam(pthread_self(), SCHED_RR, &rr);
++                std::fprintf(stderr, "HakiosMetal: deferred recorder at round robin 54: %s\n", e == 0 ? "set" : std::strerror(e));
++            }
++#endif
+             g.unlock();
+             j.f();
+             g.lock();
+@@ -97,6 +152,10 @@ private:
+     std::condition_variable more_, done_;
+     std::deque<Job> q_;
+     bool busy_ = false, quit_ = false;
++    std::atomic<bool> prioWanted_{false};
++    bool rrSet_ = false;
++    int prioPolicy_ = 0;
++    sched_param prioParam_{};
+     static thread_local bool worker_;
+     std::thread thread_;   // last: started once the members above exist
+ };
+diff --git a/hakios-metal/src/command.cpp b/hakios-metal/src/command.cpp
+index 8ca4f22..fb86112 100644
+--- a/hakios-metal/src/command.cpp
++++ b/hakios-metal/src/command.cpp
+@@ -1,3 +1,6 @@
++#include <cstdio>
++#include <pthread.h>
++#include <sched.h>
+ #include "hakios-metal/command.hpp"
+ #include "hakios-metal/texture.hpp"
+ 
+@@ -8,6 +11,26 @@
+ #include <mutex>
+ #include <cstring>
+ 
++
++namespace {
++// (sapphire) whether /var/tmp/metal.args asks for the driver's threads at fixed priority 54 (metal_rr54): off by default
++// since the phone froze with it on (13 November), to be tried alone
++inline bool hmRr54Wanted() {
++    static int on = -1;
++    if (on < 0) {
++        on = 0;
++        if (FILE* f = std::fopen("/var/tmp/metal.args", "r")) {
++            char b[1024] = "";
++            size_t n = std::fread(b, 1, sizeof b - 1, f);
++            b[n] = 0;
++            std::fclose(f);
++            on = std::strstr(b, "metal_rr54") != nullptr;
++        }
++    }
++    return on == 1;
++}
++}  // namespace
++
+ namespace hakios::metal {
+ 
+ namespace {
+@@ -420,8 +443,9 @@ CommandBuffer::CommandBuffer(CommandQueue& queue) : queue_(queue) {
+             gStreamPool.pop_back();
+         }
+     }
+-    if (w.capacity() < 16384) w.reserve(16384);
++    if (w.capacity() < 98304) w.reserve(98304);   // (sapphire: a frame of CoreAnimation's is some 60 000 words; no growing on the way)
+     stream_.adopt(std::move(w));
++    uses_.reserve(4096);   // (sapphire: one entry a buffer a draw)
+ }
+ 
+ CommandBuffer::~CommandBuffer() {
+@@ -429,7 +453,7 @@ CommandBuffer::~CommandBuffer() {
+         std::vector<uint32_t> w = stream_.release();
+         if (w.capacity() <= (1u << 20)) {
+             std::lock_guard<std::mutex> l(gStreamPoolLock);
+-            if (gStreamPool.size() < 8) gStreamPool.push_back(std::move(w));
++            if (gStreamPool.size() < 16) gStreamPool.push_back(std::move(w));
+         }
+     }
+     // (a buffer never completed may be destroyed with the GPU still on it -- an error -- and its stamps are then not
+@@ -667,6 +691,16 @@ void CommandQueue::submit(std::shared_ptr<CommandBuffer> cb) {
+ }
+ 
+ void CommandQueue::waiter() {
++#ifdef __APPLE__
++    // (sapphire) completions are what the window server waits on to start its next frame: this thread at the render
++    // thread's fixed priority (round robin 54), not the default 31 that every application thread (47) put off
++    {
++        sched_param rr{};
++        rr.sched_priority = 54;
++        pthread_setname_np("hakios-metal.completions");
++        if (hmRr54Wanted()) pthread_setschedparam(pthread_self(), SCHED_RR, &rr);
++    }
++#endif
+     std::unique_lock<std::mutex> g(lock_);
+     for (;;) {
+         changed_.wait(g, [this] { return quit_ || !inFlight_.empty(); });
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index 5bc8482..34f2dde 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -1558,12 +1558,12 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     }
+     memset(tableCpu + kTableFbReadFlushAt, 0, 4);   // (the draw's own table: zero before the flush below writes it)
+     memcpy(tableCpu + kGfxIboAt, ibos.words, size_t(ibos.count) * 64);
+-    memset(tableCpu + kFsTexConstAt, 0, kMaxTextureSlots * 64);
+-    memset(tableCpu + kFsTexSampAt, 0, kMaxTextureSlots * 16);
+-    memcpy(tableCpu + kFsTexConstAt, fsTex.texWords, sizeof fsTex.texWords);
+-    memcpy(tableCpu + kFsTexSampAt, fsTex.sampWords, sizeof fsTex.sampWords);
+-    memcpy(tableCpu + kVsTexConstAt, vsTex.texWords, sizeof vsTex.texWords);
+-    memcpy(tableCpu + kVsTexSampAt, vsTex.sampWords, sizeof vsTex.sampWords);
++    // (sapphire) the descriptors the loads below read, numTex and numSamp of each stage, and no more: the whole tables,
++    // zeroed then copied, were 5 KB of stores a draw
++    memcpy(tableCpu + kFsTexConstAt, fsTex.texWords, size_t(fsTex.numTex) * 64);
++    memcpy(tableCpu + kFsTexSampAt, fsTex.sampWords, size_t(fsTex.numSamp) * 16);
++    memcpy(tableCpu + kVsTexConstAt, vsTex.texWords, size_t(vsTex.numTex) * 64);
++    memcpy(tableCpu + kVsTexSampAt, vsTex.sampWords, size_t(vsTex.numSamp) * 16);
+     MrtWords mrts[kMaxColorOutputs] = {};
+     uint32_t srgbMask = 0;
+     for (uint32_t i = 0; i < numRt; i++) {
+@@ -1758,7 +1758,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         reg(stream, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
+         loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, kInstrCacheSize), address);
+         if (s.k.numImmediates != 0) {
+-            std::vector<uint32_t> imm(s.k.immediates, s.k.immediates + s.k.numImmediates);
++            static thread_local std::vector<uint32_t> imm;   // (sapphire: no allocation a draw)
++            imm.assign(s.k.immediates, s.k.immediates + s.k.numImmediates);
+             imm.resize((imm.size() + 3) & ~size_t(3), 0);
+             loadDirect(stream, s, ST6_CONSTANTS, s.k.immediatesOffsetVec4, uint32_t(imm.size() / 4), imm.data(), uint32_t(imm.size()));
+         }
+@@ -1960,10 +1961,11 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         // (a depth written by the stage, into a pass with a depth attachment: its register, and FRAG_WRITES_Z, as
+         // tu6_emit_fs_outputs sets them for a stage writing FRAG_RESULT_DEPTH)
+         const bool fragDepth = fs.depthRegid != kRegidNone && pass.depth != nullptr;
+-        std::vector<uint32_t> out = {components, spFsOutputCntl0(fragDepth ? fs.depthRegid : kRegidNone, kRegidNone, kRegidNone, dual),
+-                                     A6XX_SP_FS_OUTPUT_CNTL1_MRT(numRt)};
+-        for (uint32_t i = 0; i < numOut; i++) out.push_back(spFsOutputReg(fs.colorRegid[i], fs.colorHalf[i] != 0));
+-        stream.registers(REG_A6XX_SP_FS_RENDER_COMPONENTS, out.data(), uint32_t(out.size()));
++        uint32_t out[3 + kMaxColorOutputs] = {components, spFsOutputCntl0(fragDepth ? fs.depthRegid : kRegidNone, kRegidNone, kRegidNone, dual),
++                                              A6XX_SP_FS_OUTPUT_CNTL1_MRT(numRt)};   // (sapphire: on the stack)
++        uint32_t nOut = 3;
++        for (uint32_t i = 0; i < numOut && i < kMaxColorOutputs; i++) out[nOut++] = spFsOutputReg(fs.colorRegid[i], fs.colorHalf[i] != 0);
++        stream.registers(REG_A6XX_SP_FS_RENDER_COMPONENTS, out, nOut);
+         regs(stream, REG_A6XX_RB_FS_OUTPUT_CNTL0, {(fragDepth ? A6XX_RB_FS_OUTPUT_CNTL0_FRAG_WRITES_Z : 0u) | (dual ? A6XX_RB_FS_OUTPUT_CNTL0_DUAL_COLOR_IN_ENABLE : 0u),
+                                                    A6XX_RB_FS_OUTPUT_CNTL1_MRT(numRt), components});
+     }
+diff --git a/userland/src/HakiosMetalCA.m b/userland/src/HakiosMetalCA.m
+index c4e64f9..183cd6e 100644
+--- a/userland/src/HakiosMetalCA.m
++++ b/userland/src/HakiosMetalCA.m
+@@ -8798,6 +8798,51 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
+ 	hakios_metal_program *program = [_pipeline hakiosProgramFor:fs offsets:_fsOffsets count:_fsHighest];
+ 
+ 	hm_dump_config(hakios_metal_program_name(program), fs, _fsOffsets, _fsHighest);
++	/* (sapphire, a diagnostic) metal_watch=WORD (underscores for spaces): while /var/tmp/metal.watch exists, the draws whose
++	 * trace line holds WORD, 60 at most: viewport, scissor, the draw's vertices and buffer 1's first floats */
++	{
++		static int on = -1;
++		static char word[128];
++		static int lines;
++		if (on < 0) {
++			char args[1024] = "";
++			size_t size = sizeof(args) - 1;
++			const char *at;
++			on = 0;
++			if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_watch=")) != NULL) {
++				at += strlen("metal_watch=");
++				for (size_t i = 0; i + 1 < sizeof(word) && at[i] != '\0' && at[i] != ' '; i++) word[i] = at[i] == '_' ? ' ' : at[i];
++				on = 1;
++			}
++		}
++		if (on && lines < 60 && access("/var/tmp/metal.watch", F_OK) == 0) {
++			const void *which = [_pipeline hakiosProgram];
++			NSString *cfg = hm_constants_of(which);
++			NSMutableString *line = [NSMutableString stringWithFormat:@"%s (fc%@) into %ux%u", hakios_metal_program_name([_pipeline hakiosProgram]), cfg,
++				_pass.color0 != NULL ? hakios_metal_texture_width(_pass.color0) : 0, _pass.color0 != NULL ? hakios_metal_texture_height(_pass.color0) : 0];
++			for (unsigned i = 0; i < _fsHighestTexture; i++) {
++				if (_fsTextures[i] != nil) [line appendFormat:@" t%u=%lux%lu", i, (unsigned long)[_fsTextures[i] width], (unsigned long)[_fsTextures[i] height]];
++			}
++			if (strstr([line UTF8String], word) != NULL) {
++				lines++;
++				[line appendFormat:@" | vp %s %.1f,%.1f %.1fx%.1f z %.2f-%.2f sc %s %u,%u %ux%u | prim %lu start %lu count %lu idx %d",
++					_hasViewport ? "set" : "-", _viewport.x, _viewport.y, _viewport.width, _viewport.height, _viewport.znear, _viewport.zfar,
++					_hasScissor ? "set" : "-", _scissor.x, _scissor.y, _scissor.width, _scissor.height,
++					(unsigned long)primitive, (unsigned long)start, (unsigned long)count, indexBuffer != nil];
++				if (_vsHighest > 1 && _vsBuffers[1] != nil) {
++					const float *v = (const float *)((const uint8_t *)[_vsBuffers[1] contents] + _vsOffsets[1]);
++					[line appendString:@" | vb1"];
++					for (int k = 0; k < 24; k++) [line appendFormat:@" %.3g", v[k]];
++				}
++				if (_vsHighest > 0 && _vsBuffers[0] != nil) {
++					const float *v = (const float *)((const uint8_t *)[_vsBuffers[0] contents] + _vsOffsets[0]);
++					[line appendString:@" | vb0"];
++					for (int k = 0; k < 20; k++) [line appendFormat:@" %.3g", v[k]];
++				}
++				hm_print("watch: %s\n", [line UTF8String]);
++			}
++		}
++	}
+ 	if (hm_trace_draw([_pipeline hakiosProgram], hakios_metal_program_name([_pipeline hakiosProgram]), &_pass, fsTex, _fsHighestTexture, (unsigned)primitive, 0)) {
+ 		return;
+ 	}
+@@ -9059,6 +9104,39 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
+ 
+ - (void)endEncoding
+ {
++	/* (sapphire, a diagnostic) metal_snap: while /var/tmp/metal.snap holds "W H", the first 6 passes into a W x H texture
++	 * of its own are written, once the GPU has drawn them, to /var/tmp/snap-N.raw (BGRA rows, W*4 bytes each) */
++	{
++		static int on = -1;
++		static int snaps;
++		if (on < 0) {
++			char args[1024] = "";
++			size_t size = sizeof(args) - 1;
++			on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_snap") != NULL;
++		}
++		if (on && snaps < 6 && _colorTexture != nil && [_colorTexture iosurface] == NULL) {
++			FILE *f = fopen("/var/tmp/metal.snap", "r");
++			unsigned w = 0, h = 0;
++			if (f != NULL) {
++				if (fscanf(f, "%u %u", &w, &h) != 2) w = h = 0;
++				fclose(f);
++			}
++			if (w != 0 && [_colorTexture width] == w && [_colorTexture height] == h) {
++				const int n = snaps++;
++				HakiosMetalTexture *t = [_colorTexture retain];
++				[_commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
++					(void)buffer;
++					NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)w * h * 4];
++					[t getBytes:[d mutableBytes] bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
++					char path[64];
++					snprintf(path, sizeof(path), "/var/tmp/snap-%d.raw", n);
++					[d writeToFile:[NSString stringWithUTF8String:path] atomically:NO];
++					hm_print("snap: %s, a %ux%u pass (fmt %lu)\n", path, w, h, (unsigned long)[t pixelFormat]);
++					[t release];
++				}];
++			}
++		}
++	}
+ 	/* a Clear no draw spent: the pass still owes it (a pass that only clears is how many clients wipe a drawable) */
+ 	/* (not on a command buffer a refused draw already failed -- it holds an error before commit: its first sentence is the one that matters) */
+ 	if (hm_owes_clear(&_pass) && hakios_metal_cb_error([self hakiosCb])[0] == '\0' &&
