@@ -8798,6 +8798,51 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 	hakios_metal_program *program = [_pipeline hakiosProgramFor:fs offsets:_fsOffsets count:_fsHighest];
 
 	hm_dump_config(hakios_metal_program_name(program), fs, _fsOffsets, _fsHighest);
+	/* (sapphire, a diagnostic) metal_watch=WORD (underscores for spaces): while /var/tmp/metal.watch exists, the draws whose
+	 * trace line holds WORD, 60 at most: viewport, scissor, the draw's vertices and buffer 1's first floats */
+	{
+		static int on = -1;
+		static char word[128];
+		static int lines;
+		if (on < 0) {
+			char args[1024] = "";
+			size_t size = sizeof(args) - 1;
+			const char *at;
+			on = 0;
+			if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_watch=")) != NULL) {
+				at += strlen("metal_watch=");
+				for (size_t i = 0; i + 1 < sizeof(word) && at[i] != '\0' && at[i] != ' '; i++) word[i] = at[i] == '_' ? ' ' : at[i];
+				on = 1;
+			}
+		}
+		if (on && lines < 60 && access("/var/tmp/metal.watch", F_OK) == 0) {
+			const void *which = [_pipeline hakiosProgram];
+			NSString *cfg = hm_constants_of(which);
+			NSMutableString *line = [NSMutableString stringWithFormat:@"%s (fc%@) into %ux%u", hakios_metal_program_name([_pipeline hakiosProgram]), cfg,
+				_pass.color0 != NULL ? hakios_metal_texture_width(_pass.color0) : 0, _pass.color0 != NULL ? hakios_metal_texture_height(_pass.color0) : 0];
+			for (unsigned i = 0; i < _fsHighestTexture; i++) {
+				if (_fsTextures[i] != nil) [line appendFormat:@" t%u=%lux%lu", i, (unsigned long)[_fsTextures[i] width], (unsigned long)[_fsTextures[i] height]];
+			}
+			if (strstr([line UTF8String], word) != NULL) {
+				lines++;
+				[line appendFormat:@" | vp %s %.1f,%.1f %.1fx%.1f z %.2f-%.2f sc %s %u,%u %ux%u | prim %lu start %lu count %lu idx %d",
+					_hasViewport ? "set" : "-", _viewport.x, _viewport.y, _viewport.width, _viewport.height, _viewport.znear, _viewport.zfar,
+					_hasScissor ? "set" : "-", _scissor.x, _scissor.y, _scissor.width, _scissor.height,
+					(unsigned long)primitive, (unsigned long)start, (unsigned long)count, indexBuffer != nil];
+				if (_vsHighest > 1 && _vsBuffers[1] != nil) {
+					const float *v = (const float *)((const uint8_t *)[_vsBuffers[1] contents] + _vsOffsets[1]);
+					[line appendString:@" | vb1"];
+					for (int k = 0; k < 24; k++) [line appendFormat:@" %.3g", v[k]];
+				}
+				if (_vsHighest > 0 && _vsBuffers[0] != nil) {
+					const float *v = (const float *)((const uint8_t *)[_vsBuffers[0] contents] + _vsOffsets[0]);
+					[line appendString:@" | vb0"];
+					for (int k = 0; k < 20; k++) [line appendFormat:@" %.3g", v[k]];
+				}
+				hm_print("watch: %s\n", [line UTF8String]);
+			}
+		}
+	}
 	if (hm_trace_draw([_pipeline hakiosProgram], hakios_metal_program_name([_pipeline hakiosProgram]), &_pass, fsTex, _fsHighestTexture, (unsigned)primitive, 0)) {
 		return;
 	}
@@ -9059,6 +9104,39 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 
 - (void)endEncoding
 {
+	/* (sapphire, a diagnostic) metal_snap: while /var/tmp/metal.snap holds "W H", the first 6 passes into a W x H texture
+	 * of its own are written, once the GPU has drawn them, to /var/tmp/snap-N.raw (BGRA rows, W*4 bytes each) */
+	{
+		static int on = -1;
+		static int snaps;
+		if (on < 0) {
+			char args[1024] = "";
+			size_t size = sizeof(args) - 1;
+			on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_snap") != NULL;
+		}
+		if (on && snaps < 6 && _colorTexture != nil && [_colorTexture iosurface] == NULL) {
+			FILE *f = fopen("/var/tmp/metal.snap", "r");
+			unsigned w = 0, h = 0;
+			if (f != NULL) {
+				if (fscanf(f, "%u %u", &w, &h) != 2) w = h = 0;
+				fclose(f);
+			}
+			if (w != 0 && [_colorTexture width] == w && [_colorTexture height] == h) {
+				const int n = snaps++;
+				HakiosMetalTexture *t = [_colorTexture retain];
+				[_commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+					(void)buffer;
+					NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)w * h * 4];
+					[t getBytes:[d mutableBytes] bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+					char path[64];
+					snprintf(path, sizeof(path), "/var/tmp/snap-%d.raw", n);
+					[d writeToFile:[NSString stringWithUTF8String:path] atomically:NO];
+					hm_print("snap: %s, a %ux%u pass (fmt %lu)\n", path, w, h, (unsigned long)[t pixelFormat]);
+					[t release];
+				}];
+			}
+		}
+	}
 	/* a Clear no draw spent: the pass still owes it (a pass that only clears is how many clients wipe a drawable) */
 	/* (not on a command buffer a refused draw already failed -- it holds an error before commit: its first sentence is the one that matters) */
 	if (hm_owes_clear(&_pass) && hakios_metal_cb_error([self hakiosCb])[0] == '\0' &&
