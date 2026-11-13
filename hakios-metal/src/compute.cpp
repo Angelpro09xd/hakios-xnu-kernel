@@ -427,7 +427,8 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
         stream.registers(REG_A6XX_SP_CS_CONFIG, v, 2);
     }
     reg(stream, REG_A6XX_SP_CS_CTRL_REG0,
-        spCsCtrlReg0(uint32_t(k.maxReg + 1), uint32_t(k.maxHalfReg + 1), k.branchstackHw, threadsize, k.mergedRegs, k.earlyPreamble));
+        spCsCtrlReg0(uint32_t(k.maxReg + 1), uint32_t(k.maxHalfReg + 1), k.branchstackHw,
+                     kSupportsDoubleThreadsize ? threadsize : THREAD128, k.mergedRegs, k.earlyPreamble));   // (fd6_program.cc: THREAD128 without double threadsize)
     // the shared memory and constant split, in both the SP's and (gen4's) the HLSQ's copy, the same value: Gallium gives
     // the HLSQ the real size where computerator writes 1, and the one that is right when they disagree is not measured
     uint32_t ctrl1 = spCsCtrlReg1(shared, k.constlen);
@@ -436,8 +437,13 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
         reg(stream, REG_A6XX_HLSQ_CS_CTRL_REG1, ctrl1);
     }
     {
-        uint32_t v[2] = {csCntl0(k.workGroupIdRegid, k.localIdRegid), csCntl1(threadsize)};
+        // a chip without double threadsize (the A610, a6xx_gen1_low) reads the compute wave size from HLSQ_FS_CNTL_0 and
+        // wants THREAD128 in HLSQ_CS_CNTL_1 (fd6_compute.cc cs_program_emit, "always set to THREAD128")
+        uint32_t v[2] = {csCntl0(k.workGroupIdRegid, k.localIdRegid), csCntl1(kSupportsDoubleThreadsize ? threadsize : THREAD128)};
         stream.registers(REG_A6XX_HLSQ_CS_CNTL_0, v, 2);   // HLSQ_CS_CNTL_0, HLSQ_CS_CNTL_1
+        if (!kSupportsDoubleThreadsize) {
+            reg(stream, REG_A6XX_HLSQ_FS_CNTL_0, A6XX_HLSQ_FS_CNTL_0_THREADSIZE(threadsize));
+        }
         if (o.hlsqCopies) {
             stream.registers(REG_A6XX_SP_CS_CNTL_0, v, 2); // SP_CS_CNTL_0, SP_CS_CNTL_1 (has_lpac)
         }

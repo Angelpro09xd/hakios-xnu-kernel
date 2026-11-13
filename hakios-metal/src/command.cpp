@@ -152,7 +152,11 @@ std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* wh
             freeBytes_ -= size;
         }
     }
-    if (b == nullptr) return newBuffer(gpu_, size, why);
+    if (b == nullptr) {
+        b = newBuffer(gpu_, size, why);
+        if (b != nullptr) b->setPoolable();
+        return b;
+    }
     gBuffersReused++;
     memset(b->contents(), 0, size);   // (as a new one comes from the kernel)
     return b;
@@ -160,7 +164,7 @@ std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* wh
 
 void CommandQueue::giveBuffer(std::shared_ptr<Buffer> b) {
     // (only one no one else holds, of a size takeBuffer makes: a piece's buffer kept elsewhere is still someone's)
-    if (b == nullptr || b.use_count() != 1 || b->contents() == nullptr || b->length() != sizeClass(b->length())) return;
+    if (b == nullptr || !b->poolable() || b.use_count() != 1 || b->contents() == nullptr || b->length() != sizeClass(b->length())) return;
     std::lock_guard<std::mutex> g(poolLock_);
     if (freeBytes_ + b->length() > (32ull << 20)) return;
     freeBytes_ += b->length();
@@ -401,7 +405,33 @@ void CommandBuffer::waitUntilCompleted() {
     done_.wait(g, [this] { return finished_ || status_ <= kEnqueued; });
 }
 
+namespace {
+// (sapphire) command streams' storage, recycled from the command buffers that are gone to the ones being made
+std::mutex gStreamPoolLock;
+std::vector<std::vector<uint32_t>> gStreamPool;
+}  // namespace
+
+CommandBuffer::CommandBuffer(CommandQueue& queue) : queue_(queue) {
+    std::vector<uint32_t> w;
+    {
+        std::lock_guard<std::mutex> l(gStreamPoolLock);
+        if (!gStreamPool.empty()) {
+            w = std::move(gStreamPool.back());
+            gStreamPool.pop_back();
+        }
+    }
+    if (w.capacity() < 16384) w.reserve(16384);
+    stream_.adopt(std::move(w));
+}
+
 CommandBuffer::~CommandBuffer() {
+    {
+        std::vector<uint32_t> w = stream_.release();
+        if (w.capacity() <= (1u << 20)) {
+            std::lock_guard<std::mutex> l(gStreamPoolLock);
+            if (gStreamPool.size() < 8) gStreamPool.push_back(std::move(w));
+        }
+    }
     // (a buffer never completed may be destroyed with the GPU still on it -- an error -- and its stamps are then not
     // given back; one that completed has had its readers)
     if (finished_) {

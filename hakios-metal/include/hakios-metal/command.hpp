@@ -43,10 +43,16 @@ public:
     void* contents() const { return bo_->cpu(); }
     uint64_t gpuAddress() const { return bo_->gpuAddress(); }
     const Bo& bo() const { return *bo_; }
+    // (sapphire) made by the queue's pool (CommandQueue::takeBuffer): the only kind giveBuffer takes back. A surface's
+    // or a caller's buffer of a size-class length went into the pool, and the next takeBuffer's memset wrote over the
+    // surface and past its mapping (backboardd: SIGSEGV in takeBuffer, 11 November)
+    bool poolable() const { return poolable_; }
+    void setPoolable() { poolable_ = true; }
 
 private:
     std::unique_ptr<Bo> bo_;
     uint64_t length_;
+    bool poolable_ = false;
 };
 
 std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why);
@@ -111,9 +117,29 @@ public:
     // a blit the caller could not record (a buffer not in the GPU's memory, say): the buffer ends in the error state
     void refuse(const std::string& why) { fail(why); }
     // a buffer it uses, kept alive until it completes (the owner may let go of it before that)
-    void keep(std::shared_ptr<const Buffer> b) { kept_.push_back(std::move(b)); }
+    // (sapphire) a draw keeps the same few buffers, target and program as the draws before it: what one of the last 64
+    // kept is not kept again (a vector of a thousand shared_ptrs a frame, and their atomic counts, otherwise)
+    void keep(std::shared_ptr<const Buffer> b) {
+        if (b == nullptr) return;
+        const void* raw = b.get();
+        if (recentlyKept(raw)) return;
+        kept_.push_back(std::move(b));
+    }
     // anything else it uses (a compiled kernel's words), the same way
-    void keepAlive(std::shared_ptr<const void> p) { keptAny_.push_back(std::move(p)); }
+    void keepAlive(std::shared_ptr<const void> p) {
+        if (p == nullptr) return;
+        if (recentlyKept(p.get())) return;
+        keptAny_.push_back(std::move(p));
+    }
+private:
+    const void* recent_[64] = {};
+    bool recentlyKept(const void* raw) {
+        const size_t slot = (reinterpret_cast<uintptr_t>(raw) >> 4) & 63;
+        if (recent_[slot] == raw) return true;
+        recent_[slot] = raw;
+        return false;
+    }
+public:
     // OTHER's recorded work after this one's, as if it had been recorded here: its packets, what it names and what it
     // keeps alive -- a parallel render encoder's sub-encoders each record into a command buffer of their own, from any
     // thread in any order, and are appended in the order they were made. OTHER is left empty and is not committed; an
@@ -179,7 +205,7 @@ public:
 
 private:
     friend class CommandQueue;
-    explicit CommandBuffer(CommandQueue& queue) : queue_(queue) {}
+    explicit CommandBuffer(CommandQueue& queue);
 public:
     ~CommandBuffer();   // (its stamp buffers back to the queue: read until the last reader lets go, which is now)
 private:
@@ -220,41 +246,59 @@ public:
     // find and insert, two lookups and a node a register, were most of a draw's 20 us of deduplication on the phone)
     class RegShadow {
     public:
+        // (sapphire) a slot per register: the A6xx register file is 16 bits of address, so the table is indexed by the
+        // register itself (no hashing, no probing), and emptied by moving to a new generation rather than by a fill
+        // (the 512 KB tables are kept in a pool and reused: a fresh one was an mmap and 128 page faults, two a pass)
+        RegShadow() : table_(take()) {}
+        ~RegShadow() { give(table_); }
+        RegShadow(const RegShadow&) = delete;
+        RegShadow& operator=(const RegShadow&) = delete;
         // whether REG held VALUE; it holds VALUE from now on
         bool hold(uint32_t reg, uint32_t value) {
-            if (keys_.empty() || 2 * (used_ + 1) > keys_.size()) grow();
-            const size_t mask = keys_.size() - 1;
-            for (size_t i = (reg * 2654435761u) & mask;; i = (i + 1) & mask) {
-                if (keys_[i] == reg) {
-                    const bool same = values_[i] == value;
-                    values_[i] = value;
-                    return same;
-                }
-                if (keys_[i] == kEmpty) {
-                    keys_[i] = reg;
-                    values_[i] = value;
-                    used_++;
-                    return false;
-                }
-            }
+            if (reg >= kRegs) return false;
+            Slot& s = table_->slots[reg];
+            const bool same = s.gen == table_->gen && s.value == value;
+            s.value = value;
+            s.gen = table_->gen;
+            return same;
         }
         void clear() {
-            std::fill(keys_.begin(), keys_.end(), kEmpty);
-            used_ = 0;
-        }
-    private:
-        static constexpr uint32_t kEmpty = ~0u;
-        void grow() {
-            std::vector<uint32_t> keys = std::move(keys_), values = std::move(values_);
-            keys_.assign(std::max<size_t>(1024, keys.size() * 2), kEmpty);
-            values_.assign(keys_.size(), 0);
-            used_ = 0;
-            for (size_t i = 0; i < keys.size(); i++) {
-                if (keys[i] != kEmpty) hold(keys[i], values[i]);
+            if (++table_->gen == 0) {   // (after 4 billion clears: every slot old again)
+                for (uint32_t i = 0; i < kRegs; i++) table_->slots[i].gen = 0;
+                table_->gen = 1;
             }
         }
-        std::vector<uint32_t> keys_, values_;
-        size_t used_ = 0;
+    private:
+        static constexpr uint32_t kRegs = 0x10000;
+        struct Slot { uint32_t value, gen; };
+        struct Table { Slot slots[kRegs]; uint32_t gen; };
+        static std::mutex& poolLock() { static std::mutex m; return m; }
+        static std::vector<Table*>& pool() { static std::vector<Table*> p; return p; }
+        static Table* take() {
+            Table* t = nullptr;
+            {
+                std::lock_guard<std::mutex> l(poolLock());
+                if (!pool().empty()) {
+                    t = pool().back();
+                    pool().pop_back();
+                }
+            }
+            if (t == nullptr) {
+                t = new Table();
+                t->gen = 1;
+            } else if (++t->gen == 0) {
+                for (uint32_t i = 0; i < kRegs; i++) t->slots[i].gen = 0;
+                t->gen = 1;
+            }
+            return t;
+        }
+        static void give(Table* t) {
+            if (t == nullptr) return;
+            std::lock_guard<std::mutex> l(poolLock());
+            if (pool().size() < 16) pool().push_back(t);
+            else delete t;
+        }
+        Table* table_;
     };
 
 private:

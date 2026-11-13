@@ -140,6 +140,7 @@ constexpr FormatInfo kFormats[] = {
     {PixelFormat::kPVRTC_RGBA_4BPP_sRGB, FMT6_8_8_8_8_UNORM, 4, WZYX, true, true, kElemFloat, "PVRTC_RGBA_4BPP_sRGB", false, false, false, 1, 1, FMT6_NONE, 4},
     // HDR: the same storage and the same FMT6 as LDR -- A6xx has one ASTC decoder, and probe 9j2h measures what it makes
     // of an HDR block
+#if !defined(HAKIOS_CHIP_A610)   // (sapphire: the A610's decoder makes nothing of an HDR block; Mesa exposes ASTC HDR on no Adreno)
     {PixelFormat::kASTC_4x4_HDR, FMT6_ASTC_4x4, 16, WZYX, true, false, kElemFloat, "ASTC_4x4_HDR", false, false, false, 4, 4},
     {PixelFormat::kASTC_5x4_HDR, FMT6_ASTC_5x4, 16, WZYX, true, false, kElemFloat, "ASTC_5x4_HDR", false, false, false, 5, 4},
     {PixelFormat::kASTC_5x5_HDR, FMT6_ASTC_5x5, 16, WZYX, true, false, kElemFloat, "ASTC_5x5_HDR", false, false, false, 5, 5},
@@ -154,6 +155,7 @@ constexpr FormatInfo kFormats[] = {
     {PixelFormat::kASTC_10x10_HDR, FMT6_ASTC_10x10, 16, WZYX, true, false, kElemFloat, "ASTC_10x10_HDR", false, false, false, 10, 10},
     {PixelFormat::kASTC_12x10_HDR, FMT6_ASTC_12x10, 16, WZYX, true, false, kElemFloat, "ASTC_12x10_HDR", false, false, false, 12, 10},
     {PixelFormat::kASTC_12x12_HDR, FMT6_ASTC_12x12, 16, WZYX, true, false, kElemFloat, "ASTC_12x12_HDR", false, false, false, 12, 12},
+#endif
 };
 
 const char* typeName(TextureType t) {
@@ -464,6 +466,9 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         }
         fd_dev_id id{};
         id.chip_id = a6xx::kChipId;
+#if defined(HAKIOS_CHIP_A610)
+        id.gpu_id = 610;   // freedreno_devices.py lists the A610 as GPUId(610): matched by its GPU id
+#endif
         const struct ::fd_dev_info* dev = ::fd_dev_info_raw(&id);
         fdl_layout l{};
         l.ubwc = true;
@@ -1244,6 +1249,11 @@ bool makeSampler(const SamplerDesc& d, Sampler* out, std::string* why) {
     }
     // bicubic is the TP's own cubic filter, which this chip has (freedreno_devices.py a6xx_gen4 has_tex_filter_cubic;
     // turnip's VK_FILTER_CUBIC_EXT, tu6_tex_filter)
+#if defined(HAKIOS_CHIP_A610)
+    if (d.minFilter == 2 || d.magFilter == 2) {
+        return refuse(why, "bicubic filtering: the Adreno 610 has no cubic filter (a6xx_gen1_low)");
+    }
+#endif
     auto filter = [](uint32_t m) { return m == 2 ? A6XX_TEX_CUBIC : m == 1 ? A6XX_TEX_LINEAR : A6XX_TEX_NEAREST; };
     f.min = filter(d.minFilter);
     f.mag = filter(d.magFilter);

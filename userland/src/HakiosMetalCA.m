@@ -99,6 +99,7 @@
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,8 +110,65 @@
 
 /* --- printing ----------------------------------------------------------------------------------------------- */
 
+
+/* (sapphire) the kernel's boot-args and, after them, the words of /var/tmp/metal.args: the switches below without a
+ * reboot (written, then backboardd restarted). Same contract as sysctlbyname("kern.bootargs"): 0 and a string in args. */
+static int
+hm_bootargs(char *args, size_t *size)
+{
+	size_t cap = *size;
+	if (sysctlbyname("kern.bootargs", args, size, NULL, 0) != 0) {
+		return -1;
+	}
+	size_t used = strnlen(args, cap);
+	int fd = open("/var/tmp/metal.args", O_RDONLY);
+	if (fd >= 0 && used + 2 < cap) {
+		args[used++] = ' ';
+		ssize_t r = read(fd, args + used, cap - used - 1);
+		if (r > 0) {
+			used += (size_t)r;
+		}
+		args[used] = '\0';
+		for (size_t i = 0; i < used; i++) {
+			if (args[i] == '\n') args[i] = ' ';
+		}
+		*size = used + 1;
+	}
+	if (fd >= 0) close(fd);
+	return 0;
+}
 static void hm_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static int hm_print_fd = -1;    /* where hm_print writes: stderr, the console, or (metal_m2v=1) a copy of stderr kept aside */
+
+/* metal_fbprobe: is the display surface read back (sampled, copied from) or drawn with a viewport/scissor? (for a
+ * render scale under the display's) */
+static int hm_fbprobe_on = -1;
+static void
+hm_fbprobe(id texture, const char *what, unsigned a, unsigned b, unsigned c, unsigned d)
+{
+	static unsigned counts[8];
+	static double last;
+	if (hm_fbprobe_on < 0) {
+		{ char args[1024]; size_t size = sizeof(args); hm_fbprobe_on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fbprobe") != NULL; }
+	}
+	if (!hm_fbprobe_on || texture == nil || ![texture respondsToSelector:@selector(iosurface)]) {
+		return;
+	}
+	IOSurfaceRef s = ((IOSurfaceRef (*)(id, SEL))objc_msgSend)(texture, @selector(iosurface));
+	if (s == NULL) {
+		return;
+	}
+	size_t w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s);
+	if (!((w == 375 && h == 812) || (w == 750 && h == 1624) || (w == 828 && h == 1792) || (w == 414 && h == 896))) {
+		return;
+	}
+	unsigned k = (unsigned)(what[0] + what[1]) & 7;
+	if (counts[k]++ < 6) {
+		hm_print("fbprobe: %s on the display surface %zux%zu: %u %u %u %u\n", what, w, h, a, b, c, d);
+	}
+	(void)last;
+}
+
 
 /* To stderr, as one write: a launchd job's stderr is the console (userland/mkjobs.py sets StandardErrorPath) and its
  * stdout is nowhere, so the window server's lines -- the client this plug-in is for -- reached no log while they went
@@ -532,6 +590,9 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 	MTLTextureSwizzleChannels _swizzle;
 	void (^_deallocator)(void *, NSUInteger);   /* a no-copy texture's: its caller's bytes are given back at dealloc */
 	int _ycbcr;                         /* a two-plane surface read as RGBA8 converted from it: 0 not, 1 BT.601, 2 BT.709 */
+	uint8_t *_ycReady;                  /* (sapphire) rows converted off the render thread, waiting to be put in */
+	uint32_t _ycReadySeed;              /* ... the surface's seed they were taken at */
+	BOOL _ycBusy;                        /* ... a conversion running */
 	BOOL _ycbcrFull;                    /* ... '420f' (full range) rather than '420v' (video range) */
 	MTLPixelFormat _ycbcrFormat;        /* ... and the private format it was asked as (500, 540), which it answers */
 	void *_deallocBytes;
@@ -1209,6 +1270,8 @@ HM_REFUSES_OUT_LOUD
 	int _specBinding;
 	unsigned _specLength;
 	NSMutableDictionary *_specialised;
+	char _specPath[160];   /* (sapphire) where this pipeline's specialisation keys are remembered */
+	struct hm_spec_ready { uint64_t hash; const uint8_t *bytes; hakios_metal_program *program; } _ready[512];   /* (sapphire) open addressing, written once a slot */
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device program:(hakios_metal_program *)program
 			  descriptor:(MTLRenderPipelineDescriptor *)descriptor;
@@ -1310,6 +1373,7 @@ HM_REFUSES_OUT_LOUD
 	struct hakios_metal_viewport _viewport;
 	struct hakios_metal_scissor _scissor;
 	BOOL _hasViewport, _hasScissor;             /* unset: hakios-metal takes the whole attachment (NULL) */
+	double _fbScale;                            /* (sapphire 0321) under 1: a panel surface, drawn into its top-left _fbScale part */
 	id _indirectArgs;                           /* the next draw is indirect: its words at _indirectOffset of this buffer */
 	NSUInteger _indirectOffset;
 	HakiosMetalBuffer *_vsBuffers[HM_MAX_BUFFERS];
@@ -1364,7 +1428,7 @@ hm_strict(void)
 		char args[1024] = {0};
 		size_t size = sizeof(args) - 1;
 
-		strict = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_strict") != NULL;
+		strict = hm_bootargs(args, &size) == 0 && strstr(args, "metal_strict") != NULL;
 	}
 	return strict != 0;
 }
@@ -1736,7 +1800,7 @@ hm_dump_function(const char *label, id function, const char *key, const hakios_m
 	size_t size = sizeof(args) - 1;
 	const char *at;
 
-	if (function == nil || sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (at = strstr(args, key)) == NULL ||
+	if (function == nil || hm_bootargs(args, &size) != 0 || (at = strstr(args, key)) == NULL ||
 	    ![function respondsToSelector:sel_getUid("bitcodeData")]) {
 		return;
 	}
@@ -2084,7 +2148,7 @@ ca_prof_start(void)
 		const char *at;
 		pthread_t sampler;
 
-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (at = strstr(args, "ca_prof=")) == NULL) return;
+		if (hm_bootargs(args, &size) != 0 || (at = strstr(args, "ca_prof=")) == NULL) return;
 		ca_prof_us = (unsigned)atoi(at + 8);
 		if (ca_prof_us == 0) return;
 		pthread_create(&sampler, NULL, ca_prof_main, NULL);
@@ -2115,7 +2179,7 @@ hm_boot_arg_set(const char *what)
 	char args[1024] = "";
 	size_t size = sizeof(args) - 1;
 
-	return sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, what) != NULL;
+	return hm_bootargs(args, &size) == 0 && strstr(args, what) != NULL;
 }
 
 - (instancetype)initWithAcceleratorPort:(io_service_t)port
@@ -2130,7 +2194,7 @@ hm_boot_arg_set(const char *what)
 		const char *name = getprogname();
 
 		if (all < 0) {
-			all = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_all=1") != NULL;
+			all = hm_bootargs(args, &size) == 0 && strstr(args, "metal_all=1") != NULL;
 		}
 		if (!all && (name == NULL || strcmp(name, "backboardd") != 0)) {
 			HM_ONCE("%s is not shown the device: the window server alone is (metal_all=1: every process)\n", name ? name : "?");
@@ -2146,7 +2210,7 @@ hm_boot_arg_set(const char *what)
 			size_t size = sizeof(args) - 1;
 			const char *at;
 
-			if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "tu_debug=")) != NULL) {
+			if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "tu_debug=")) != NULL) {
 				strlcpy(value, at + 9, sizeof(value));
 				value[strcspn(value, " ")] = 0;
 				setenv("TU_DEBUG", value, 1);
@@ -3280,7 +3344,7 @@ hm_describe_function(id f)
 				char args[1024] = {0}, *at;
 				size_t size = sizeof(args) - 1;
 
-				if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_dump=")) != NULL &&
+				if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_dump=")) != NULL &&
 				    (uint32_t)strtoul(at + 11, NULL, 16) == h) {
 					for (NSUInteger o = 0; o < [air length]; o += 64) {
 						char line[160];
@@ -3494,7 +3558,7 @@ hm_compress_ok(void)
 		char args[1024] = {0};
 		size_t size = sizeof(args) - 1;
 
-		off = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_noubwc") != NULL;
+		off = hm_bootargs(args, &size) == 0 && strstr(args, "metal_noubwc") != NULL;
 	}
 	return !off;
 }
@@ -4195,6 +4259,7 @@ HM_REFUSES_OUT_LOUD
 	if (_iosurface != NULL) {
 		CFRelease(_iosurface);
 	}
+	free(_ycReady);
 	free(_shadowBase);
 	if (_turnedSurface != NULL) {
 		hakios_metal_texture_free(_turnedSurface);
@@ -4390,9 +4455,8 @@ HM_REFUSES_OUT_LOUD
 	[self hakiosShadow:surface];
 }
 
-static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_t)(v + 0.5f); }
 
-- (void)hakiosConvertYCbCr
+- (uint8_t *)hakiosConvertYCbCrRows
 {
 	const size_t w = hakios_metal_texture_width(_texture), h = hakios_metal_texture_height(_texture);
 	const uint8_t *luma = IOSurfaceGetBaseAddressOfPlane(_iosurface, 0), *chroma = IOSurfaceGetBaseAddressOfPlane(_iosurface, 1);
@@ -4405,37 +4469,62 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 
 	if (rows == NULL || luma == NULL || chroma == NULL || cw == 0 || ch == 0) {
 		free(rows);
-		return;
+		return NULL;
 	}
-	for (size_t j = 0; j < h; j++) {
-		const uint8_t *yl = luma + j * lumaRow, *cl = chroma + MIN(j / 2, ch - 1) * chromaRow;
-		uint8_t *out = rows + j * w * 4;
+	/* (sapphire) by tables in 16.16 fixed point and in bands of rows over the processors: the float loop, one pixel at a
+	 * time on the render thread, took 30 ms for a 1105x1160 photo every time the surface changed -- a hitch each time.
+	 * The same matrix: R = Y + 2(1-Kr)Cr, B = Y + 2(1-Kb)Cb, G = Y - (2Kr(1-Kr)Cr + 2Kb(1-Kb)Cb)/Kg */
+	int32_t ytab[256], crR[256], crG[256], cbG[256], cbB[256];
+	for (int v = 0; v < 256; v++) {
+		const float y = (v - yo) * ys, c = (v - 128.0f) * cs;
+		ytab[v] = (int32_t)lrintf(y * 65536.0f);
+		crR[v] = (int32_t)lrintf(2.0f * (1.0f - kr) * c * 65536.0f);
+		cbB[v] = (int32_t)lrintf(2.0f * (1.0f - kb) * c * 65536.0f);
+		crG[v] = (int32_t)lrintf(2.0f * kr * (1.0f - kr) / kg * c * 65536.0f);
+		cbG[v] = (int32_t)lrintf(2.0f * kb * (1.0f - kb) / kg * c * 65536.0f);
+	}
+	const BOOL planes540 = _ycbcrFormat == (MTLPixelFormat)540;
+	const int32_t *ytp = ytab, *crRp = crR, *crGp = crG, *cbGp = cbG, *cbBp = cbB;   /* (a block takes no C array) */
+	const size_t bands = h >= 64 ? 8 : 1;
+	dispatch_apply(bands, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t band) {
+		const size_t j0 = h * band / bands, j1 = h * (band + 1) / bands;
+		for (size_t j = j0; j < j1; j++) {
+			const uint8_t *yl = luma + j * lumaRow, *cl = chroma + MIN(j / 2, ch - 1) * chromaRow;
+			uint8_t *out = rows + j * w * 4;
 
-		for (size_t i = 0; i < w; i++) {
-			const size_t c = MIN(i / 2, cw - 1) * 2;
+			for (size_t i = 0; i < w; i++) {
+				const size_t c = MIN(i / 2, cw - 1) * 2;
 
-			/* RGB8_420_2P (540) is the planes as they are, the chroma at each pixel: R Cr, G Y, B Cb. VideoToolbox's
-			 * converter samples it, takes (G, B, R) as (Y, Cb, Cr) and applies the matrix itself; converted here
-			 * too, the live wallpaper came out in colours it never had. */
-			if (_ycbcrFormat == (MTLPixelFormat)540) {
-				out[4 * i] = cl[c + 1];
-				out[4 * i + 1] = yl[i];
-				out[4 * i + 2] = cl[c];
+				/* RGB8_420_2P (540) is the planes as they are, the chroma at each pixel: R Cr, G Y, B Cb. VideoToolbox's
+				 * converter samples it, takes (G, B, R) as (Y, Cb, Cr) and applies the matrix itself; converted here
+				 * too, the live wallpaper came out in colours it never had. */
+				if (planes540) {
+					out[4 * i] = cl[c + 1];
+					out[4 * i + 1] = yl[i];
+					out[4 * i + 2] = cl[c];
+					out[4 * i + 3] = 255;
+					continue;
+				}
+				const int32_t y = ytp[yl[i]], cb = cl[c], cr = cl[c + 1];
+				int32_t r = (y + crRp[cr] + 32768) >> 16, g = (y - crGp[cr] - cbGp[cb] + 32768) >> 16, b = (y + cbBp[cb] + 32768) >> 16;
+				out[4 * i] = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
+				out[4 * i + 1] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g);
+				out[4 * i + 2] = (uint8_t)(b < 0 ? 0 : b > 255 ? 255 : b);
 				out[4 * i + 3] = 255;
-				continue;
 			}
-			const float y = (yl[i] - yo) * ys, cb = (cl[c] - 128.0f) * cs, cr = (cl[c + 1] - 128.0f) * cs;
-			const float r = y + 2.0f * (1.0f - kr) * cr, b = y + 2.0f * (1.0f - kb) * cb;
-			const float g = (y - kr * r - kb * b) / kg;
-
-			out[4 * i] = hm_clamp8(r);
-			out[4 * i + 1] = hm_clamp8(g);
-			out[4 * i + 2] = hm_clamp8(b);
-			out[4 * i + 3] = 255;
 		}
+	});
+	return rows;
+}
+
+- (void)hakiosConvertYCbCr
+{
+	uint8_t *rows = [self hakiosConvertYCbCrRows];
+	if (rows != NULL) {
+		(void)hakios_metal_texture_replace(_texture, 0, 0, hakios_metal_texture_width(_texture), hakios_metal_texture_height(_texture), rows,
+						   (uint64_t)hakios_metal_texture_width(_texture) * 4);
+		free(rows);
 	}
-	(void)hakios_metal_texture_replace(_texture, 0, 0, (unsigned)w, (unsigned)h, rows, (uint64_t)w * 4);
-	free(rows);
 }
 
 - (void)hakiosRefreshShadow
@@ -4446,6 +4535,53 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 	}
 	uint32_t seed;
 
+	/* (sapphire) a YCbCr copy after its first: the planes are converted on another thread when the surface changes and
+	 * the rows put in at the first refresh that finds them -- the frame that sees the change draws the copy as it was
+	 * (a photo, a video frame, one frame late), rather than the render thread waiting 10-30 ms for the conversion */
+	if (_shadow && _iosurface != NULL && _ycbcr != 0 && _shadowSeed != 0) {
+		uint8_t *ready = NULL;
+		uint32_t readySeed = 0;
+		@synchronized(self) {
+			ready = _ycReady;
+			readySeed = _ycReadySeed;
+			_ycReady = NULL;
+		}
+		if (ready != NULL) {
+			const double began = hm_now();
+			(void)hakios_metal_texture_replace(_texture, 0, 0, hakios_metal_texture_width(_texture), hakios_metal_texture_height(_texture), ready,
+							   (uint64_t)hakios_metal_texture_width(_texture) * 4);
+			free(ready);
+			_shadowSeed = readySeed;
+			hm_fps_shadow(YES, hm_now() - began);
+		}
+		seed = IOSurfaceGetSeed(_iosurface);
+		BOOL start = NO;
+		@synchronized(self) {
+			if (seed != _shadowSeed && !_ycBusy && _ycReady == NULL) {
+				_ycBusy = YES;
+				start = YES;
+			}
+		}
+		if (start) {
+			[self retain];
+			dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+				uint8_t *rows = NULL;
+				const uint32_t taken = IOSurfaceGetSeed(_iosurface);
+				if (IOSurfaceLock(_iosurface, kIOSurfaceLockReadOnly, NULL) == kIOReturnSuccess) {
+					rows = [self hakiosConvertYCbCrRows];
+					IOSurfaceUnlock(_iosurface, kIOSurfaceLockReadOnly, NULL);
+				}
+				@synchronized(self) {
+					free(_ycReady);
+					_ycReady = rows;
+					_ycReadySeed = taken;
+					_ycBusy = NO;
+				}
+				[self release];
+			});
+		}
+		return;
+	}
 	if (!_shadow || _iosurface == NULL || (seed = IOSurfaceGetSeed(_iosurface)) == _shadowSeed) {
 		return;
 	}
@@ -4968,7 +5104,7 @@ HM_REFUSES_OUT_LOUD
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
 
-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_defer=1") != NULL) {
+		if (hm_bootargs(args, &size) == 0 && strstr(args, "metal_defer=1") != NULL) {   /* (sapphire: off by default -- uneven frames with it) */
 			hakios_metal_queue_set_deferred(_queue, 1);
 			HM_ONCE("command buffers recorded deferred, by a thread of hakios-metal's (metal_defer=1)\n");
 		}
@@ -5659,7 +5795,7 @@ hm_gmem_on(void)
 		char args[1024] = {0};
 		size_t size = sizeof(args) - 1;
 
-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_gmem=1") != NULL;
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_gmem=1") != NULL;
 	}
 	return on != 0;
 }
@@ -5674,7 +5810,7 @@ hm_fps_draws(void)
 		char args[1024] = {0};
 		size_t size = sizeof(args) - 1;
 
-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=draws") != NULL;
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps=draws") != NULL;
 	}
 	return on != 0;
 }
@@ -5694,7 +5830,7 @@ hm_gmem_off(void)
 		const char *at;
 
 		bits = 0;
-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_gmem_off=")) != NULL) {
+		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_gmem_off=")) != NULL) {
 			bits = atoi(at + strlen("metal_gmem_off="));
 		}
 	}
@@ -5716,7 +5852,7 @@ hm_gmem_draws(void)
 		const char *at;
 
 		draws = 56;
-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_gmem_draws=")) != NULL) {
+		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_gmem_draws=")) != NULL) {
 			draws = atoi(at + strlen("metal_gmem_draws="));
 		}
 	}
@@ -5732,7 +5868,7 @@ hm_fps_on(void)
 		char args[1024] = {0};
 		size_t size = sizeof(args) - 1;
 
-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps") != NULL;
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps") != NULL;
 	}
 	return on != 0;
 }
@@ -5783,7 +5919,7 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				if (passesOn < 0) {
 					char args[1024] = "";
 					size_t size = sizeof(args) - 1;
-					passesOn = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=passes") != NULL;
+					passesOn = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps=passes") != NULL;
 				}
 				int n = passesOn ? hakios_metal_cb_pass_time(cb, 0, NULL, NULL, NULL, NULL, NULL) : 0;
 				double total = 0, us;
@@ -5825,7 +5961,7 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				if (mainOn < 0) {
 					char args[1024] = "";
 					size_t size = sizeof(args) - 1;
-					mainOn = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=mainpass") != NULL;
+					mainOn = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps=mainpass") != NULL;
 				}
 				const BOOL main = mainOn && slowUs > 4000 && slowDraws >= 40 && mainShown < 6;
 				mainShown += main ? 1 : 0;
@@ -6051,8 +6187,23 @@ hm_fps_shadow(BOOL in, double seconds)
  * this phone took 40 on a fast core, so the difference is something the host does not show.
  */
 static volatile mach_port_t hm_sample_thread;   /* the thread inside a draw call, or 0 */
-static uint64_t hm_samples[16384], hm_samplesBy[16384], hm_samplesBy2[16384];   /* the PC, and the first caller outside the system's libraries */
+static uint64_t hm_samples[16384], hm_samplesBy[16384], hm_samplesBy2[16384];
+static uint32_t hm_stacks[16384][14];
+static uint64_t hm_raw[16384][14];   /* (sapphire) the same frames as addresses, for metal_fps=thread */   /* (sapphire) the pc and the frame chain, as offsets into this image (0: outside it) */
+static uintptr_t hm_image_lo;   /* the PC, and the first caller outside the system's libraries */
 static volatile unsigned hm_sampled;
+
+static BOOL
+hm_thread_mode(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		char args[1024] = {0};
+		size_t size = sizeof(args) - 1;
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps=thread") != NULL;
+	}
+	return on != 0;
+}
 
 static BOOL
 hm_sampling(void)
@@ -6063,7 +6214,7 @@ hm_sampling(void)
 		char args[1024] = {0};
 		size_t size = sizeof(args) - 1;
 
-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=sample") != NULL;
+		on = hm_bootargs(args, &size) == 0 && (strstr(args, "metal_fps=sample") != NULL || strstr(args, "metal_fps=thread") != NULL);
 	}
 	return on != 0;
 }
@@ -6097,6 +6248,27 @@ hm_sampler(void *unused)
 				}
 				fp = f[0];
 			}
+			{
+				uint32_t *row = hm_stacks[hm_sampled];
+				uint64_t pc = __darwin_arm_thread_state64_get_pc(st) & 0x0000007fffffffffull, f2 = __darwin_arm_thread_state64_get_fp(st);
+				hm_image_lo = lo;
+				row[0] = pc >= lo && pc < hi ? (uint32_t)(pc - lo) : 0;
+				uint64_t l2 = lr & 0x0000007fffffffffull;
+				row[1] = l2 >= lo && l2 < hi ? (uint32_t)(l2 - lo) : 0;
+				for (int d = 2; d < 14; d++) row[d] = 0;
+				uint64_t *raw = hm_raw[hm_sampled];
+				for (int d = 0; d < 14; d++) raw[d] = 0;
+				raw[0] = pc;
+				raw[1] = l2;
+				for (int d = 2; d < 14 && f2 != 0 && (f2 & 7) == 0; d++) {
+					const uint64_t *f = (const uint64_t *)f2;
+					const uint64_t ret = f[1] & 0x0000007fffffffffull;
+					row[d] = ret >= lo && ret < hi ? (uint32_t)(ret - lo) : 0;
+					raw[d] = ret;
+					if (f[0] <= f2) break;
+					f2 = f[0];
+				}
+			}
 			hm_samplesBy[hm_sampled] = by;
 			hm_samplesBy2[hm_sampled] = by2;
 			hm_samples[hm_sampled++] = __darwin_arm_thread_state64_get_pc(st);
@@ -6114,6 +6286,28 @@ hm_sample_report(void)
 	unsigned kinds = 0, total = hm_sampled;
 
 	if (total == 0) return;
+	{
+		if (hm_thread_mode()) {
+			FILE *tf = fopen("/var/tmp/hm-thread.txt", "a");
+			for (unsigned i = 0; tf != NULL && i < total; i++) {
+				for (int d = 0; d < 14 && hm_raw[i][d] != 0; d++) {
+					Dl_info di;
+					if (dladdr((const void *)hm_raw[i][d], &di) && di.dli_fname) {
+						const char *b = strrchr(di.dli_fname, '/');
+						fprintf(tf, "%s+%llx ", b ? b + 1 : di.dli_fname, (unsigned long long)(hm_raw[i][d] - (uint64_t)di.dli_fbase));
+					} else fprintf(tf, "?+%llx ", (unsigned long long)hm_raw[i][d]);
+				}
+				fputc(10, tf);
+			}
+			if (tf != NULL) fclose(tf);
+		}
+		FILE *sf = fopen("/var/tmp/hm-stacks.txt", "a");
+		for (unsigned i = 0; sf != NULL && i < total; i++) {
+			for (int d = 0; d < 14; d++) fprintf(sf, "%x ", hm_stacks[i][d]);
+			fputc(10, sf);
+		}
+		if (sf != NULL) fclose(sf);
+	}
 	for (unsigned i = 0; i < total; i++) {
 		Dl_info info;
 		const char *name = dladdr((const void *)hm_samples[i], &info) && info.dli_sname ? info.dli_sname : "?";
@@ -6234,7 +6428,7 @@ hm_timeline_on(void)
 		char args[1024] = {0};
 		size_t size = sizeof(args) - 1;
 
-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=timeline") != NULL;
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps=timeline") != NULL;
 	}
 	return on != 0;
 }
@@ -6266,7 +6460,7 @@ hm_completed(hakios_metal_cb *cb, void *context)
 			char args[1024] = "";
 			size_t size = sizeof(args) - 1;
 
-			lines = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "touch_lat=1") != NULL;
+			lines = hm_bootargs(args, &size) == 0 && strstr(args, "touch_lat=1") != NULL;
 		}
 		if (lines) {
 			fprintf(stderr, "tl: M made %.0f committed %.0f done %.0f gpu %.0f\n", [self hakiosCreatedAt] * 1e6,
@@ -6636,6 +6830,8 @@ hm_blit_texture(hakios_metal_cb *cb, id object, const char *what)
 {
 	hakios_metal_cb *cb = [_commandBuffer hakiosCommandBuffer];
 	hakios_metal_texture *from = hm_blit_texture(cb, sourceTexture, "source");
+	hm_fbprobe(sourceTexture, "copied from", (unsigned)sourceOrigin.x, (unsigned)sourceOrigin.y, (unsigned)sourceSize.width, (unsigned)sourceSize.height);
+	hm_fbprobe(destinationTexture, "copied to", (unsigned)destinationOrigin.x, (unsigned)destinationOrigin.y, (unsigned)sourceSize.width, (unsigned)sourceSize.height);
 	hakios_metal_texture *to = from != NULL ? hm_blit_texture(cb, destinationTexture, "destination") : NULL;
 
 	if (to == NULL) {
@@ -7341,7 +7537,7 @@ hm_rows_texture(HakiosMetalBlitCommandEncoder *self, hakios_metal_cb *cb, hakios
 	if (traced < 0) {
 		char args[1024] = {0};
 		size_t size = sizeof(args) - 1;
-		traced = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_trace_release") != NULL;
+		traced = hm_bootargs(args, &size) == 0 && strstr(args, "metal_trace_release") != NULL;
 	}
 	if (traced && [self retainCount] == 1) {
 		char what[128];
@@ -7398,7 +7594,7 @@ hm_spec_off(void)
 		char args[1024] = {0};
 		size_t size = sizeof(args) - 1;
 
-		off = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_nospec") != NULL;
+		off = hm_bootargs(args, &size) == 0 && strstr(args, "metal_nospec") != NULL;
 	}
 	return off != 0;
 }
@@ -7418,7 +7614,10 @@ hm_spec_off(void)
 		if (hakios_metal_program_resource(_program, 1, i, &kind, &index, &size) == 0 && kind == HAKIOS_METAL_RESOURCE_CONSTANT_BUFFER &&
 		    size != 0 && size <= 256 && (_specBinding < 0 || (unsigned)index < (unsigned)_specBinding)) {
 			_specBinding = (int)index;
-			_specLength = size;
+			/* (sapphire) CoreAnimation's 52-byte uber shader block ends in a value (1.0, 501.0, two halves...: 45 of them in one
+			 * session), not a choice of path: specialised on, every animated value was a new 1 s compilation. The first 48 bytes
+			 * decide the path; the last word stays a load the shader makes */
+			_specLength = size == 52 ? 48 : size;
 		}
 	}
 	if (_specBinding < 0) return;
@@ -7426,6 +7625,109 @@ hm_spec_off(void)
 	_fsConstantCount = count < 64 ? count : 64;
 	memcpy(_fsConstants, constants, _fsConstantCount * sizeof(*constants));
 	_specialised = [[NSMutableDictionary alloc] init];
+	/* (sapphire) this pipeline's name on disk: its fragment function's bitcode, constants and deciding buffer */
+	{
+		uint64_t h = 1469598103934665603ull;
+		const uint8_t *b = [air bytes];
+		for (NSUInteger k = 0; k < [air length]; k++) h = (h ^ b[k]) * 1099511628211ull;
+		const uint8_t *c = (const uint8_t *)_fsConstants;
+		for (size_t k = 0; k < _fsConstantCount * sizeof(*_fsConstants); k++) h = (h ^ c[k]) * 1099511628211ull;
+		h ^= (uint64_t)_specBinding << 48 ^ (uint64_t)hakios_metal_program_stage_words(_program, 0) << 20 ^ _specLength;
+		const char *dir = getenv("HAKIOS_METAL_CACHE");
+		snprintf(_specPath, sizeof(_specPath), "%s/spec-%016llx.keys", dir ? dir : "/var/tmp", (unsigned long long)h);
+	}
+	{
+		FILE *f = fopen(_specPath, "r");
+		char line[600];
+		unsigned started = 0;
+		while (f != NULL && fgets(line, sizeof(line), f) != NULL && started < 256) {
+			size_t n = strcspn(line, "\r\n") / 2;
+			if (n != _specLength) continue;
+			NSMutableData *key = [NSMutableData dataWithLength:n];
+			uint8_t *k = [key mutableBytes];
+			for (size_t q = 0; q < n; q++) { unsigned v = 0; sscanf(line + 2 * q, "%2x", &v); k[q] = (uint8_t)v; }
+			@synchronized(self) {
+				if ([_specialised objectForKey:key] != nil) continue;
+				[_specialised setObject:[NSNull null] forKey:key];
+			}
+			[self hakiosSpecialise:key remember:NO];
+			started++;
+		}
+		if (f != NULL) fclose(f);
+		if (started) hm_print("specialise: %s: %u specialisations remembered from before, started now\n", hakios_metal_program_name(_program), started);
+	}
+}
+
+
+
+/* (sapphire) the draw's fast road to a ready specialisation: FNV-1a of the deciding bytes into _ready (512 slots, linear
+ * probing); a slot is filled once (program last, after a barrier) and never changed, so readers need no lock */
+static uint64_t
+hm_spec_hash(const uint8_t *b, unsigned n)
+{
+	uint64_t h = 1469598103934665603ull;
+	for (unsigned k = 0; k < n; k++) h = (h ^ b[k]) * 1099511628211ull;
+	return h | 1;
+}
+
+/* (sapphire) compile the program for KEY (the deciding buffer's bytes) on the specialising queue; REMEMBER: a key this
+ * pipeline was not given before, appended to its file so that the next start of the window server begins with it */
+- (void)hakiosSpecialise:(NSData *)key remember:(BOOL)remember
+{
+	static dispatch_queue_t compiling;
+	static dispatch_once_t once;
+
+	if (remember && _specPath[0] != 0) {
+		int fd = open(_specPath, O_WRONLY | O_APPEND | O_CREAT, 0666);
+		if (fd >= 0) {
+			char line[2 * 256 + 2];
+			const uint8_t *b = [key bytes];
+			size_t n = [key length] < 256 ? [key length] : 256;
+			for (size_t k = 0; k < n; k++) snprintf(line + 2 * k, 3, "%02x", b[k]);
+			line[2 * n] = 10;
+			(void)!write(fd, line, 2 * n + 1);
+			close(fd);
+		}
+	}
+	dispatch_once(&once, ^{
+		compiling = dispatch_queue_create("hakios.metal.specialise", DISPATCH_QUEUE_SERIAL);
+	});
+	[self retain];
+	dispatch_async(compiling, ^{
+		struct timespec t0, t1;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		hakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,
+									 (unsigned)_specBinding, [key bytes], [key length]);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		if (p == NULL) {
+			hm_print("specialise: %s for its buffer %d: %s; its own program goes on\n", hakios_metal_program_name(_program), _specBinding,
+				 hakios_metal_error());
+		} else if (hm_fps_on()) {
+			hm_print("specialise: %s for %u bytes of its buffer %d: %u instruction words, not %u, in %.0f ms\n", hakios_metal_program_name(_program),
+				 _specLength, _specBinding, hakios_metal_program_stage_words(p, 1), hakios_metal_program_stage_words(_program, 1),
+				 (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+		}
+		@synchronized(self) {
+			if (p != NULL) [_specialised setObject:[NSValue valueWithPointer:p] forKey:key];
+			if (p != NULL) {
+				const unsigned n = (unsigned)[key length];
+				const uint64_t h = hm_spec_hash([key bytes], n);
+				for (unsigned q = 0; q < 512; q++) {
+					struct hm_spec_ready *e = &_ready[(h + q) & 511];
+					if (e->program != NULL) continue;
+					uint8_t *copy = malloc(n);
+					memcpy(copy, [key bytes], n);
+					e->hash = h;
+					e->bytes = copy;
+					__atomic_store_n(&e->program, p, __ATOMIC_RELEASE);
+					break;
+				}
+			}
+			else [_specialised setObject:@"failed" forKey:key];   /* (not tried again; its draws take the pipeline's own) */
+		}
+		[self release];
+	});
 }
 
 /* the program for a draw whose fragment buffers are BUFFERS: the one compiled for what the deciding buffer holds, or
@@ -7440,6 +7742,15 @@ hm_spec_off(void)
 	const uint8_t *bytes = (const uint8_t *)hakios_metal_buffer_contents(buffers[_specBinding]);
 	const uint64_t length = hakios_metal_buffer_length(buffers[_specBinding]), at = offsets[_specBinding];
 	if (bytes == NULL || at > length || length - at < _specLength) return _program;
+	{
+		const uint64_t h = hm_spec_hash(bytes + at, _specLength);
+		for (unsigned q = 0; q < 512; q++) {
+			struct hm_spec_ready *e = &_ready[(h + q) & 511];
+			hakios_metal_program *ep = __atomic_load_n(&e->program, __ATOMIC_ACQUIRE);
+			if (ep == NULL) break;
+			if (e->hash == h && memcmp(e->bytes, bytes + at, _specLength) == 0) return ep;
+		}
+	}
 	NSData *key = [NSData dataWithBytes:bytes + at length:_specLength];
 	hakios_metal_program *found = _program;
 	BOOL start = NO;
@@ -7449,36 +7760,30 @@ hm_spec_off(void)
 
 		if ([have isKindOfClass:[NSValue class]]) {
 			found = (hakios_metal_program *)[have pointerValue];
-		} else if (have == nil && [_specialised count] < 64) {
+		} else if (have == nil && [_specialised count] < 256) {
 			[_specialised setObject:[NSNull null] forKey:key];
 			start = YES;
 		}
 	}
 	if (start) {
-		dispatch_once(&once, ^{
-			compiling = dispatch_queue_create("hakios.metal.specialise", DISPATCH_QUEUE_SERIAL);
-		});
-		[self retain];
-		dispatch_async(compiling, ^{
-			struct timespec t0, t1;
-
-			clock_gettime(CLOCK_MONOTONIC, &t0);
-			hakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,
-										 (unsigned)_specBinding, [key bytes], [key length]);
-			clock_gettime(CLOCK_MONOTONIC, &t1);
-			if (p == NULL) {
-				hm_print("specialise: %s for its buffer %d: %s; its own program goes on\n", hakios_metal_program_name(_program), _specBinding,
-					 hakios_metal_error());
-			} else if (hm_fps_on()) {
-				hm_print("specialise: %s for %u bytes of its buffer %d: %u instruction words, not %u, in %.0f ms\n", hakios_metal_program_name(_program),
-					 _specLength, _specBinding, hakios_metal_program_stage_words(p, 1), hakios_metal_program_stage_words(_program, 1),
-					 (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
-			}
+		[self hakiosSpecialise:key remember:YES];
+	}
+	/* (sapphire) on the A610 the whole uber shader (32 000 instructions, 500 times its instruction cache) over a big area
+	 * takes past the kernel's 2 s and the GPU is reset: a draw whose program is being specialised waits for it (3 s at
+	 * most) rather than be drawn with the pipeline's own */
+	if (found == _program) {
+		for (int waited = 0; waited < 1500; waited++) {
+			id have = nil;
 			@synchronized(self) {
-				if (p != NULL) [_specialised setObject:[NSValue valueWithPointer:p] forKey:key];
+				have = [_specialised objectForKey:key];
 			}
-			[self release];
-		});
+			if ([have isKindOfClass:[NSValue class]]) {
+				found = (hakios_metal_program *)[have pointerValue];
+				break;
+			}
+			if (have == nil || [have isKindOfClass:[NSString class]]) break;   /* (past 256 contents, or one that failed: the pipeline's own) */
+			usleep(2000);
+		}
 	}
 	return found;
 }
@@ -7564,6 +7869,22 @@ hm_spec_off(void)
 	_colorTexture = [texture retain];
 	_pass = *pass;
 	_frontFacingWinding = MTLWindingClockwise;   /* Metal's default */
+	_fbScale = hm_panel_scale(texture);
+	if (_fbScale < 1) {
+		const double w = (double)[texture width] * _fbScale, h = (double)[texture height] * _fbScale;
+		_viewport.x = 0;
+		_viewport.y = 0;
+		_viewport.width = w;
+		_viewport.height = h;
+		_viewport.znear = 0;
+		_viewport.zfar = 1;
+		_hasViewport = YES;
+		_scissor.x = 0;
+		_scissor.y = 0;
+		_scissor.width = (unsigned)ceil(w);
+		_scissor.height = (unsigned)ceil(h);
+		_hasScissor = YES;
+	}
 	return self;
 }
 
@@ -7629,6 +7950,110 @@ hm_spec_off(void)
 	_pipeline = state;
 }
 
+/*
+ * (sapphire, xnu 0321) a render scale under iOS's 2x: kern.sweet_fb_rscale (permille) of each side of the surfaces the
+ * panel shows (kern.sweet_fb_ids) is drawn, the top-left part: a pass into one has its viewport and scissor scaled, and
+ * the surface sampled back (CoreAnimation's blurs read the screen as a texture) is that part, a smaller texture over
+ * the same rows, so that its normalized coordinates fall where they were drawn. The kernel's panel copy scales the same
+ * part onto the panel. iOS keeps its 2x geometry and assets.
+ */
+static int hm_rs_permille = 1000;
+static uint32_t hm_rs_ids[4];
+static double hm_rs_read;
+static void
+hm_rs_refresh(void)
+{
+	const double now = (double)mach_absolute_time();
+	static double tick;
+	if (tick == 0) {
+		mach_timebase_info_data_t tb;
+		mach_timebase_info(&tb);
+		tick = (double)tb.numer / (double)tb.denom;
+	}
+	if (hm_rs_read != 0 && (now - hm_rs_read) * tick < 250e6) {
+		return;
+	}
+	hm_rs_read = now;
+	int v = 1000;
+	size_t size = sizeof(v);
+	if (sysctlbyname("kern.sweet_fb_rscale", &v, &size, NULL, 0) != 0 || v < 400 || v > 1000) {
+		v = 1000;
+	}
+	uint32_t ids[4] = {0, 0, 0, 0};
+	size = sizeof(ids);
+	if (sysctlbyname("kern.sweet_fb_ids", ids, &size, NULL, 0) != 0) {
+		memset(ids, 0, sizeof(ids));
+	}
+	memcpy(hm_rs_ids, ids, sizeof(ids));
+	hm_rs_permille = v;
+}
+static double
+hm_panel_scale(id texture)
+{
+	if (texture == nil || ![texture respondsToSelector:@selector(iosurface)]) {
+		return 1;
+	}
+	IOSurfaceRef s = ((IOSurfaceRef (*)(id, SEL))objc_msgSend)(texture, @selector(iosurface));
+	if (s == NULL) {
+		return 1;
+	}
+	hm_rs_refresh();
+	if (hm_rs_permille >= 1000) {
+		return 1;
+	}
+	const uint32_t sid = IOSurfaceGetID(s);
+	for (int i = 0; i < 4; i++) {
+		if (sid != 0 && hm_rs_ids[i] == sid && (size_t)[texture width] == IOSurfaceGetWidth(s) &&
+		    (size_t)[texture height] == IOSurfaceGetHeight(s)) {
+			return hm_rs_permille / 1000.0;
+		}
+	}
+	return 1;
+}
+/* the part drawn of a panel surface, as a texture of its own (made once a surface and scale) */
+static id
+hm_panel_part(id texture)
+{
+	static NSMutableDictionary *parts;
+	const double k = hm_panel_scale(texture);
+	if (k >= 1) {
+		return nil;
+	}
+	IOSurfaceRef s = ((IOSurfaceRef (*)(id, SEL))objc_msgSend)(texture, @selector(iosurface));
+	const uint32_t sid = IOSurfaceGetID(s);
+	NSNumber *key = @(((uint64_t)sid << 16) | (uint64_t)hm_rs_permille);
+	@synchronized ([HakiosMetalTexture class]) {
+		if (parts == nil) {
+			parts = [[NSMutableDictionary alloc] init];
+		}
+		id part = [parts objectForKey:key];
+		if (part != nil) {
+			return part;
+		}
+		HakiosMetalDevice *device = (HakiosMetalDevice *)[texture device];
+		const MTLPixelFormat pf = [texture pixelFormat];
+		const unsigned w = (unsigned)ceil([texture width] * k), h = (unsigned)ceil([texture height] * k);
+		hakios_metal_texture *t = hakios_metal_texture_new_iosurface([device hakiosDevice], sid, 0, (unsigned)pf, w, h,
+									     (unsigned)MTLTextureUsageShaderRead);
+		if (t == NULL) {
+			HM_ONCE("the drawn part of a panel surface (%ux%u of IOSurface %u) could not be made: %s; the whole surface is sampled\n",
+				w, h, sid, hakios_metal_error());
+			return nil;
+		}
+		MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
+		HakiosMetalTexture *part2 = [[HakiosMetalTexture alloc] initWithHakiosDevice:device texture:t descriptor:d
+										       usage:MTLTextureUsageShaderRead];
+		[part2 hakiosSetIOSurface:s plane:0];
+		if ([parts count] > 16) {
+			[parts removeAllObjects];
+		}
+		[parts setObject:part2 forKey:key];
+		[part2 release];
+		HM_ONCE("render scale %.3f: panel surfaces are drawn %ux%u in their top-left part; sampled back as that part\n", k, w, h);
+		return part2;
+	}
+}
+
 /* --- viewport and scissor: stored, handed to the draw; unset means the whole attachment (znear 0, zfar 1) --- */
 
 - (void)setViewport:(MTLViewport)viewport
@@ -7640,6 +8065,12 @@ hm_spec_off(void)
 	_viewport.znear = viewport.znear;
 	_viewport.zfar = viewport.zfar;
 	_hasViewport = YES;
+	if (_fbScale < 1) {
+		_viewport.x *= _fbScale;
+		_viewport.y *= _fbScale;
+		_viewport.width *= _fbScale;
+		_viewport.height *= _fbScale;
+	}
 }
 
 - (void)setViewports:(const MTLViewport *)viewports count:(NSUInteger)count
@@ -7660,6 +8091,14 @@ hm_spec_off(void)
 	_scissor.width = (unsigned)rect.width;
 	_scissor.height = (unsigned)rect.height;
 	_hasScissor = YES;
+	if (_fbScale < 1) {
+		const unsigned x0 = (unsigned)floor(rect.x * _fbScale), y0 = (unsigned)floor(rect.y * _fbScale);
+		const unsigned x1 = (unsigned)ceil((rect.x + rect.width) * _fbScale), y1 = (unsigned)ceil((rect.y + rect.height) * _fbScale);
+		_scissor.x = x0;
+		_scissor.y = y0;
+		_scissor.width = x1 - x0;
+		_scissor.height = y1 - y0;
+	}
 }
 
 - (void)setScissorRects:(const MTLScissorRect *)rects count:(NSUInteger)count
@@ -7777,6 +8216,13 @@ hm_spec_off(void)
  * vertex stage's to hakios_metal_cb_set_vertex_textures before each draw (SB6_VS_TEX); one path for both --- */
 - (void)hakiosSetTexture:(id)texture atIndex:(NSUInteger)index vertex:(BOOL)vertex
 {
+	hm_fbprobe(texture, vertex ? "vertex texture" : "sampled", (unsigned)index, 0, 0, 0);
+	if (texture != nil && [texture isKindOfClass:[HakiosMetalTexture class]]) {
+		id part = hm_panel_part(texture);
+		if (part != nil) {
+			texture = part;
+		}
+	}
 	const char *stage = vertex ? "vertex" : "fragment";
 	if (index >= HM_MAX_TEXTURES) {
 		hm_print("refused: %s texture index %lu is past Metal's table of %d\n", stage, (unsigned long)index, HM_MAX_TEXTURES);
@@ -8112,7 +8558,7 @@ hm_tracing(void)
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
 
-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_trace=1") != NULL;
+		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_trace=1") != NULL;
 	}
 	return on == 1;
 }
@@ -8131,7 +8577,7 @@ hm_skip_word(void)
 		const char *at;
 
 		read = 1;
-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_skip=")) != NULL) {
+		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_skip=")) != NULL) {
 			at += strlen("metal_skip=");
 			for (size_t i = 0; i + 1 < sizeof(word) && at[i] != '\0' && at[i] != ' '; i++) {
 				word[i] = at[i] == '_' ? ' ' : at[i];
@@ -8157,7 +8603,7 @@ hm_dump_config(const char *program, hakios_metal_buffer *const *buffers, const u
 		const char *at;
 
 		state = 0;
-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_dump=cfg:")) != NULL) {
+		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_dump=cfg:")) != NULL) {
 			at += strlen("metal_dump=cfg:");
 			for (size_t i = 0; i + 1 < sizeof(name) && at[i] != '\0' && at[i] != ' '; i++) name[i] = at[i];
 			state = name[0] != '\0';
@@ -8201,7 +8647,7 @@ hm_luma_boost_left_out(const char *program)
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
 
-		keep = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_luma_boost=1") != NULL;
+		keep = hm_bootargs(args, &size) == 0 && strstr(args, "metal_luma_boost=1") != NULL;
 		HM_ONCE("luma_boost: %s (metal_luma_boost=1 draws it)\n", keep ? "drawn" : "left out, the picture as it is");
 	}
 	return !keep;
@@ -8263,7 +8709,7 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 	}
 	[self hakiosDrawOnce:primitive vertexStart:start vertexCount:count instanceCount:instances indexBuffer:indexBuffer indexType:indexType
 		 indexOffset:indexOffset baseVertex:baseVertex baseInstance:baseInstance];
-	if (began != 0 && hm_sampling()) {
+	if (began != 0 && hm_sampling() && !hm_thread_mode()) {
 		const mach_port_t me = hm_sample_thread;
 		hm_sample_thread = 0;
 		mach_port_deallocate(mach_task_self(), me);
@@ -8295,6 +8741,20 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 		hm_print("refused: this draw, because %s; the command buffer is failed\n", _refused);
 		hakios_metal_cb_refuse(cb, _refused);
 		return;
+	}
+	/* (sapphire, a measurement) metal_skipgrad=1: CoreAnimation's gradient layers -- a 256x1 RGBA16Float table at
+	 * texture 3 -- left undrawn, to see what the home screen's layered wallpaper costs a frame */
+	{
+		static int skip = -1;
+		if (skip < 0) {
+			char args[1024] = "";
+			size_t size = sizeof(args) - 1;
+			skip = hm_bootargs(args, &size) == 0 && strstr(args, "metal_skipgrad=1") != NULL;
+		}
+		if (skip && _fsHighestTexture > 3 && _fsTextures[3] != nil && [_fsTextures[3] width] == 256 && [_fsTextures[3] height] == 1 &&
+		    [_fsTextures[3] pixelFormat] == MTLPixelFormatRGBA16Float) {
+			return;
+		}
 	}
 	for (unsigned i = 0; i < _vsHighest; i++) {
 		vs[i] = _vsBuffers[i] != nil ? [_vsBuffers[i] hakiosBuffer] : NULL;

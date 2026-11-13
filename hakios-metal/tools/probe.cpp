@@ -6,6 +6,8 @@
 // the rule the probe computes from the shaders' text.
 // One line per check, "probe: ok ..." or "probe: FAIL ...", and a last line with the count; the exit status is the
 // number of failures. Run it from a job list (hakios: RC_JOBS, EXTRA=).
+#include <unistd.h>
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -146,6 +148,8 @@ struct Readback {
     uint32_t firstWrongAt = 0, firstWrongValue = 0;
 };
 
+// (sapphire) which words a dispatch wrote: one character per 16 written words, # all right, . all canary, x mixed
+static std::string gMap;
 static Readback readBack(const Buffer& b, uint32_t written, uint32_t c, uint32_t canaryValue) {
     std::vector<uint32_t> back(b.length() / 4);
     memcpy(back.data(), b.contents(), b.length());   // one read of the write-combined memory, in order
@@ -167,6 +171,13 @@ static Readback readBack(const Buffer& b, uint32_t written, uint32_t c, uint32_t
             (back[i] == canaryValue ? r.beyondCanary : r.beyondOther)++;
         }
     }
+    gMap.clear();
+    for (uint32_t i = 0; i < written && i < back.size(); i += 16) {
+        uint32_t ok = 0, can = 0;
+        for (uint32_t j = i; j < i + 16 && j < written; j++) { ok += back[j] == expectedWord(j, c); can += back[j] == canaryValue; }
+        gMap += ok == 16 ? '#' : can == 16 ? '.' : 'x';
+    }
+    if (getenv("HM_MAP") && written) std::printf("probe: map [%s] word0 %08x word64 %08x word127 %08x\n", gMap.c_str(), back[0], back.size() > 64 ? back[64] : 0, back.size() > 127 ? back[127] : 0);
     return r;
 }
 
@@ -427,6 +438,58 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // (sapphire) HM_BENCH=FRAMES: the driver's CPU cost per draw on the phone, CoreAnimation-like (90 draws a frame, 750x1624)
+    if (getenv("HM_BENCH")) {
+        TextureDesc td;
+        td.format = PixelFormat::kBGRA8Unorm;
+        td.width = 750;
+        td.height = 1624;
+        td.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+        std::string bw;
+        auto bt = Texture::make(gpu, td, &bw);
+        const bool withTex = getenv("HM_BENCH_TEX") != nullptr;
+        Program bp = withTex ? Program{kernels::tri_color_vs_air, kernels::tri_tex_fs_air, Linkage{}, "tri_tex"}
+                             : Program{kernels::tri_flat_vs_air, kernels::tri_flat_fs_air, Linkage{}, "tri_flat"};
+        TextureDesc sd;
+        sd.format = PixelFormat::kRGBA8Unorm;
+        sd.width = 750;
+        sd.height = 1624;
+        sd.usage = kTextureUsageRead;
+        auto bsrc = Texture::make(gpu, sd, &bw);
+        Sampler bsmp;
+        makeSampler(SamplerDesc{}, &bsmp, &bw);
+        Bindings bfs;
+        if (withTex) {
+            bfs.textures = {bsrc.get()};
+            bfs.samplers = {&bsmp};
+        }
+        RenderPass bpass;
+        bpass.color0 = bt.get();
+        const int frames = atoi(getenv("HM_BENCH")) > 1 ? atoi(getenv("HM_BENCH")) : 100, draws = 90;
+        double drawUs = 0, commitUs = 0, waitUs = 0;
+        for (int fr = 0; fr < frames; fr++) {
+            auto cb = queue->commandBuffer();
+            for (int i = 0; i < draws; i++) {
+                Draw d;
+                d.vertexCount = 6;
+                d.viewport = Viewport{0, 0, 750, 1624, 0, 1};
+                auto a = std::chrono::steady_clock::now();
+                bool ok = cb->draw(bp, bpass, d, Bindings{}, bfs);
+                drawUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - a).count();
+                if (!ok) { std::printf("bench refused: %s\n", cb->error().c_str()); return 1; }
+            }
+            auto a = std::chrono::steady_clock::now();
+            cb->commit();
+            auto b = std::chrono::steady_clock::now();
+            cb->waitUntilCompleted();
+            auto c = std::chrono::steady_clock::now();
+            commitUs += std::chrono::duration<double, std::micro>(b - a).count();
+            waitUs += std::chrono::duration<double, std::micro>(c - b).count();
+        }
+        std::printf("bench: %d frames of %d draws: %.2f us a draw call, commit %.0f us, GPU wait %.0f us a frame\n", frames, draws,
+                    drawUs / (frames * draws), commitUs / frames, waitUs / frames);
+        return 0;
+    }
     // 1. a copy of a megabyte, checked byte for byte and around its edges
     const uint64_t mb = 1 << 20;
     auto a = newBuffer(gpu, mb, &why), b = newBuffer(gpu, mb, &why);
@@ -548,7 +611,7 @@ int main(int argc, char** argv) {
             // 5a00. chain160_air (96 units) with its preload cut to 64 units: the control is the same kernel fully
             // preloaded (5d2). Right here means the GPU fetches past a preload as it should and only the 127-unit edge
             // is wrong; wrong here means no fetch past a preload works as this driver sets it up.
-            {
+            if (!getenv("HM_SKIP_CHAINS")) {
                 const uint32_t local[3] = {64, 1, 1};
                 const uint32_t g3[3] = {16, 1, 1};
                 static_cast<uint32_t*>(cbuf->contents())[0] = c;
@@ -586,7 +649,7 @@ int main(int argc, char** argv) {
             // 5a0. chain220_air (134 units, 127 preloaded) before any other shader has run in this boot: no earlier program
             // can have left lines in the SP's instruction cache. Compared with its run in 5d2, after a dozen other
             // kernels, it tells a fetch past the preload that reads stale cache from one that reads the wrong memory.
-            {
+            if (!getenv("HM_SKIP_CHAINS")) {
                 const uint32_t local[3] = {64, 1, 1};
                 static_cast<uint32_t*>(cbuf->contents())[0] = c;
                 prefill();
@@ -764,6 +827,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (getenv("HM_EXIT_AT6")) { std::printf("probe: HM_EXIT_AT6\n"); std::fflush(stdout); _exit(0); }
     // 6. the compiler on the phone: fill_id.ll's bitcode through the AIR front end and ir3 here, on the device, and the
     // result against what the host's compiler made of the same bitcode (tests/fixtures/fill_id_air.hpp): the same words,
     // and the same buffer when dispatched. A probe built without MESA=1 says so and moves on.

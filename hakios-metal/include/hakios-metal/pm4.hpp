@@ -74,9 +74,15 @@ public:
     // any type-7 packet: OPCODE with WORDS after its header (the compute dispatch's packets, compute.cpp)
     void packet(uint32_t opcode, const uint32_t* words, uint32_t count);
 
+    // (sapphire) WORDS as they are, already packets (appendDeduped's output, one copy)
+    void append(const uint32_t* words, size_t count) { words_.insert(words_.end(), words, words + count); }
     const std::vector<uint32_t>& words() const { return words_; }
     size_t size() const { return words_.size(); }
     void clear() { words_.clear(); }
+    // (sapphire) the storage, emptied, for another stream to adopt (a command buffer's grows to some 60 000 words a
+    // frame: started empty every frame, it was copied over a dozen times on the way)
+    std::vector<uint32_t> release() { std::vector<uint32_t> w = std::move(words_); words_.clear(); w.clear(); return w; }
+    void adopt(std::vector<uint32_t>&& w) { words_ = std::move(w); words_.clear(); }
 
 private:
     void command(uint32_t opcode, uint32_t count);

@@ -37,7 +37,11 @@ void Stream::registers(uint32_t reg, const uint32_t* values, uint32_t count) {
     while (count > 0) {
         uint32_t n = count < kMaxType4Count ? count : kMaxType4Count;
         words_.push_back(type4(reg, n));
-        words_.insert(words_.end(), values, values + n);
+        if (n <= 8) {
+            for (uint32_t k = 0; k < n; k++) words_.push_back(values[k]);   // (sapphire: no memmove call for a few words)
+        } else {
+            words_.insert(words_.end(), values, values + n);
+        }
         reg += n;
         values += n;
         count -= n;

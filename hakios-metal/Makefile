@@ -92,7 +92,7 @@ ios: out/ios/libhakios-metal.a $(if $(wildcard $(IR3_CMDLINE_C)),out/ios/hakios-
 darwin: ios
 
 # with MESA=1 the compiler goes to the phone too, against the iOS build of Mesa's libraries (IOS_MESA_BUILD, tools/compiler.mk)
-IOS_CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror
+IOS_CXXFLAGS = -std=c++17 -O3 -g -mcpu=cortex-a73 -Wall -Wextra -Werror -Wno-missing-field-initializers
 IOS_LIBS     =
 ifneq ($(strip $(MESA)),)
 IOS_CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_IOS_MESA_CXXFLAGS)

@@ -1343,15 +1343,21 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
     cb->indirect = nullptr;
     // the two [[buffer(n)]] tables by Metal's index (setVertexBuffer / setFragmentBuffer); render::encode reads what each
     // stage's pushed ranges name and refuses a range with nothing bound by name
-    auto table = [](hakios_metal_buffer* const* buffers, const uint64_t* offsets, unsigned count) {
-        Bindings b;
-        b.buffers.resize(count);
+    // (sapphire: this thread's two tables, emptied and refilled -- made and freed every draw, their vectors were a few
+    // percent of a draw on the phone)
+    auto table = [](Bindings& b, hakios_metal_buffer* const* buffers, const uint64_t* offsets, unsigned count) {
+        b.buffers.assign(count, Binding{});
+        b.textures.clear();
+        b.samplers.clear();
+        b.privateMemory = PrivateMemory{};
+        b.sharedBytes = 0;
+        b.nullMask = 0;
         for (unsigned i = 0; i < count; i++) {
             if (buffers != nullptr && buffers[i] != nullptr) b.buffers[i] = Binding{buffers[i]->buffer.get(), offsets != nullptr ? offsets[i] : 0};
         }
-        return b;
     };
-    Bindings vsb = table(vsBuffers, vsOffsets, vsCount);
+    static thread_local Bindings vsb, fsb;
+    table(vsb, vsBuffers, vsOffsets, vsCount);
     // the vertex stage's textures and samplers, as hakios_metal_cb_set_vertex_textures left them, and its own constexpr
     // samplers past them, as the fragment stage's below
     for (const auto& t : cb->vsTextures) vsb.textures.push_back(t.get());
@@ -1360,7 +1366,7 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
         if (vsb.samplers.size() <= index) vsb.samplers.resize(index + 1, nullptr);
         vsb.samplers[index] = &sampler;
     }
-    Bindings fsb = table(fsBuffers, fsOffsets, fsCount);
+    table(fsb, fsBuffers, fsOffsets, fsCount);
     // the fragment stage's [[texture(n)]] and [[sampler(n)]] by Metal's index (setFragmentTexture / setFragmentSamplerState)
     fsb.textures.resize(fsTextureCount, nullptr);
     for (unsigned i = 0; i < fsTextureCount; i++) {

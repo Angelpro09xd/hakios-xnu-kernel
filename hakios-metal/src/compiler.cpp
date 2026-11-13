@@ -57,6 +57,9 @@ ir3_compiler* theCompiler() {
         fd_dev_id id{};
         id.gpu_id = 0;
         id.chip_id = a6xx::kChipId;
+#if defined(HAKIOS_CHIP_A610)
+        id.gpu_id = 610;   // freedreno_devices.py lists the A610 as GPUId(610): matched by its GPU id
+#endif
         // A framebuffer fetch (nir_texop_txf_ms_fb) through the FS's own texture table, at the slot after its last
         // texture, as turnip has it (tu_device.cc: -1): the zero default would make it a bindless read of descriptor
         // set 0, which this driver never binds

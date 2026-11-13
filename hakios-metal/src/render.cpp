@@ -666,7 +666,7 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
                 d.dword[0] |= A6XX_TEX_CONST_0_TILE_MODE(TILE6_2);
                 d.dword[2] = A6XX_TEX_CONST_2_TYPE(A6XX_TEX_2D) | A6XX_TEX_CONST_2_PITCH(gmem->binW * a.texture->info().bytesPerPixel);
                 d.dword[3] = 0;
-                d.dword[4] = gmem->base[kt.fbTarget - 1u];
+                d.dword[4] = kGmemBase + gmem->base[kt.fbTarget - 1u];   // (sapphire: 0x100000 on the A610)
                 d.dword[5] &= A6XX_TEX_CONST_5_DEPTH__MASK;
                 for (uint32_t w = 6; w < 16; w++) d.dword[w] = 0;
             }
@@ -998,45 +998,48 @@ bool checkTarget(const RenderPass& pass, std::string* why) {
         const Texture& t = *a.texture;
         const FormatInfo& f = t.info();
         // (attachment 0's sentences are the ones a single target always had; a later one's name its index)
-        const std::string which = "colour attachment " + n(i), of = i == 0 ? std::string() : " of " + which, at = i == 0 ? std::string() : which + ": ";
+        // (sapphire: made only when a sentence is said -- three strings a draw were a few us each on the phone)
+        auto which = [&] { return "colour attachment " + n(i); };
+        auto of = [&] { return i == 0 ? std::string() : " of " + which(); };
+        auto at = [&] { return i == 0 ? std::string() : which() + ": "; };
         if (t.compressed() && (i == 0 ? pass.load : pass.more[i - 1].load) == LoadAction::kClear) {
-            return refuse(why, at + "a Clear of a compressed texture: the 2D engine's fill writes linear rows (not served yet)");
+            return refuse(why, at() + "a Clear of a compressed texture: the 2D engine's fill writes linear rows (not served yet)");
         }
         if ((t.usage() & kTextureUsageRenderTarget) == 0) {
-            return refuse(why, "the " + n(t.width()) + " x " + n(t.height()) + " " + f.name + " texture" + of +
+            return refuse(why, "the " + n(t.width()) + " x " + n(t.height()) + " " + f.name + " texture" + of() +
                                    " was made without render-target usage (MTLTextureUsageRenderTarget, 4); a draw needs it");
         }
         if (t.type() != TextureType::k2D && t.type() != TextureType::k2DMultisample && t.type() != TextureType::k2DArray && t.type() != TextureType::kCube &&
             t.type() != TextureType::k3D && t.type() != TextureType::kCubeArray) {
-            return refuse(why, at + "a colour attachment of texture type " + n(uint32_t(t.type())) +
+            return refuse(why, at() + "a colour attachment of texture type " + n(uint32_t(t.type())) +
                                    ": 2D (2), 2D multisample (4), a 2D array's layer (3), a cube's or cube array's face (5, 6) and a 3D texture's plane (7) are served");
         }
         // a slice of a 2D array, a cube (array) or a 3D texture (Texture::depth() counts them all: layers, faces, planes)
         const uint32_t slices = (t.type() == TextureType::k2DArray || t.type() == TextureType::kCube || t.type() == TextureType::kCubeArray ||
                                  t.type() == TextureType::k3D) ? t.depth() : 1;
         if (a.slice >= slices) {
-            return refuse(why, at + "slice " + n(a.slice) + " of a texture of " + n(slices));
+            return refuse(why, at() + "slice " + n(a.slice) + " of a texture of " + n(slices));
         }
         if (!rbMrtPitchValid(uint32_t(t.bytesPerRow())) || t.buffer()->length() >= (1ull << 32)) {
-            return refuse(why, at + "the target's pitch of " + n(t.bytesPerRow()) + " bytes or its " + n(t.buffer()->length()) +
+            return refuse(why, at() + "the target's pitch of " + n(t.bytesPerRow()) + " bytes or its " + n(t.buffer()->length()) +
                                    " bytes do not fit RB_MRT_PITCH / RB_MRT_ARRAY_PITCH");
         }
         if (a.load != LoadAction::kLoad && a.load != LoadAction::kDontCare && a.load != LoadAction::kClear) {
-            return refuse(why, at + "load action " + n(uint32_t(a.load)) + ": MTLLoadAction is DontCare (0), Load (1) or Clear (2)");
+            return refuse(why, at() + "load action " + n(uint32_t(a.load)) + ": MTLLoadAction is DontCare (0), Load (1) or Clear (2)");
         }
         // DontCare is served as a Store: in sysmem the RB writes the target's memory as it draws, and what DontCare
         // allows -- the contents undefined after the pass -- includes keeping them
         if (a.store != StoreAction::kStore && a.store != StoreAction::kDontCare) {
-            return refuse(why, at + "store action " + n(uint32_t(a.store)) + ": Store (1) and DontCare (0) are served");
+            return refuse(why, at() + "store action " + n(uint32_t(a.store)) + ": Store (1) and DontCare (0) are served");
         }
         if (f.depth) {
-            return refuse(why, std::string("a ") + f.name + " texture as " + which + ": a depth format is the depth attachment's");
+            return refuse(why, std::string("a ") + f.name + " texture as " + which() + ": a depth format is the depth attachment's");
         }
         if (a.level >= t.levels()) {
-            return refuse(why, which + " names mip level " + n(a.level) + " of a texture of " + n(t.levels()));
+            return refuse(why, which() + " names mip level " + n(a.level) + " of a texture of " + n(t.levels()));
         }
         if (t.samples() != firstAttachment(pass)->samples()) {
-            return refuse(why, which + " has " + n(t.samples()) + " sample(s) beside another attachment's " + n(firstAttachment(pass)->samples()) +
+            return refuse(why, which() + " has " + n(t.samples()) + " sample(s) beside another attachment's " + n(firstAttachment(pass)->samples()) +
                                    ": a pass's attachments share one sample count");
         }
         // (attachments of different sizes are Metal's to allow: the window is the smallest of them, windowOf below)
@@ -1253,13 +1256,24 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
     // and discards the output (CoreAnimation's fixed_frag_lph_cpf writes three into passes of one). The stage is drawn
     // as if it did not write it -- no register for the slot, RB_MRT_CONTROL 0 -- which is the slot nothing writes.
-    Stage fsDrawn = program.fs;
-    // (a dual-source stage's second colour is the blend's second source, not attachment 1's: it is kept)
-    for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+    // (sapphire: copied only when an output is dropped -- the stage is some kilobytes, and most draws drop none)
+    bool dropsOutput = false;
+    for (uint32_t i = 0; i < kMaxColorOutputs && !dropsOutput; i++) {
         if (i == 1 && program.fs.dualSrcBlend) continue;
-        if (fsDrawn.colorRegid[i] != kRegidNone && attachmentOf(pass, i).texture == nullptr) fsDrawn.colorRegid[i] = kRegidNone;
+        dropsOutput = program.fs.colorRegid[i] != kRegidNone && attachmentOf(pass, i).texture == nullptr;
     }
-    const Stage& fs = fsDrawn;
+    static thread_local Stage fsDrawn;
+    const Stage* fsUsed = &program.fs;
+    if (dropsOutput) {
+        fsDrawn = program.fs;
+        // (a dual-source stage's second colour is the blend's second source, not attachment 1's: it is kept)
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            if (i == 1 && program.fs.dualSrcBlend) continue;
+            if (fsDrawn.colorRegid[i] != kRegidNone && attachmentOf(pass, i).texture == nullptr) fsDrawn.colorRegid[i] = kRegidNone;
+        }
+        fsUsed = &fsDrawn;
+    }
+    const Stage& fs = *fsUsed;
     // --- the two stages ---
     if (vs.kind != kStageVertex) {
         return refuse(why, std::string(stageName(vs)) + " is not a vertex stage");
@@ -1271,7 +1285,9 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         return false;
     }
     // each stage's pushed constant ranges out of its own [[buffer(n)]] table (Metal's setVertexBuffer / setFragmentBuffer)
-    std::vector<PushedRange> vsRanges, fsRanges;
+    static thread_local std::vector<PushedRange> vsRanges, fsRanges;   // (sapphire: emptied, not made a draw)
+    vsRanges.clear();
+    fsRanges.clear();
     if (!pushedRanges(vs, vsBindings, &vsRanges, why) || !pushedRanges(fs, fsBindings, &fsRanges, why)) {
         return false;
     }
@@ -1834,14 +1850,15 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
               vfdControl1(vs.vertexIdRegid, vs.instanceIdRegid, kRegidNone, kRegidNone), vfdControl2None(), vfdControl3None(), vfdControl4None(),
               vfdControl5None(), 0});
         if (fetch.count != 0) {
-            std::vector<uint32_t> dec, dst;
-            for (uint32_t loc = 0; loc < fetch.count; loc++) {
-                dec.push_back(fetch.decode[loc]);
-                dec.push_back(fetch.stepRate[loc]);
-                dst.push_back(fetch.dest[loc]);
+            uint32_t dec[2 * kVfdFetchCount], dst[kVfdFetchCount];   // (sapphire: no allocation a draw)
+            uint32_t nDec = 0, nDst = 0;
+            for (uint32_t loc = 0; loc < fetch.count && loc < kVfdFetchCount; loc++) {
+                dec[nDec++] = fetch.decode[loc];
+                dec[nDec++] = fetch.stepRate[loc];
+                dst[nDst++] = fetch.dest[loc];
             }
-            stream.registers(REG_A6XX_VFD_DECODE_INSTR, dec.data(), uint32_t(dec.size()));
-            stream.registers(REG_A6XX_VFD_DEST_CNTL_INSTR, dst.data(), uint32_t(dst.size()));
+            stream.registers(REG_A6XX_VFD_DECODE_INSTR, dec, nDec);
+            stream.registers(REG_A6XX_VFD_DEST_CNTL_INSTR, dst, nDst);
             for (uint32_t bi = 0; bi < kMaxVertexBuffers; bi++) {
                 if (!fetch.used[bi]) continue;
                 regs(stream, regVfdFetchBase(bi), {uint32_t(fetch.base[bi]), uint32_t(fetch.base[bi] >> 32), fetch.size[bi], fetch.stride[bi]});
@@ -2722,14 +2739,25 @@ void appendStream(pm4::Stream& to, const pm4::Stream& from) {
 // that is a command (HLSQ_INVALIDATE_CMD). Forgotten: everything, at a packet that may change registers behind the
 // stream's back -- anything but the waits, loads, draws, events and markers a draw is made of.
 bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegShadow& regs) {
+    // (sapphire) the same as before, written by pointer into a scratch buffer of this thread (never more words than FROM
+    // plus the NOP) and appended once: the run-by-run vector inserts were a tenth of a draw's time on the phone
     bool forgot = false;
     using namespace a6xx;
     const std::vector<uint32_t>& w = from.words();
-    to.packet(pm4::kNop, nullptr, 0);
+    static thread_local std::vector<uint32_t> scratch;
+    if (scratch.size() < w.size() + 1) scratch.resize(w.size() + 1024);
+    uint32_t* out = scratch.data();
+    *out++ = pm4::type7(pm4::kNop, 0);
     for (size_t i = 0; i < w.size();) {
         pm4::Header h = pm4::decode(w[i]);
         if (h.kind == pm4::Header::kRegisters) {
             uint32_t runStart = 0, runLen = 0;
+            auto flush = [&] {
+                *out++ = pm4::type4(h.reg + runStart, runLen);
+                memcpy(out, &w[i + 1 + runStart], 4ull * runLen);
+                out += runLen;
+                runLen = 0;
+            };
             for (uint32_t k = 0; k < h.count; k++) {
                 const uint32_t reg = h.reg + k, value = w[i + 1 + k];
                 const bool same = regs.hold(reg, value) && reg != REG_A6XX_HLSQ_INVALIDATE_CMD;
@@ -2737,11 +2765,10 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
                     if (runLen == 0) runStart = k;
                     runLen++;
                 } else if (runLen != 0) {
-                    to.registers(h.reg + runStart, &w[i + 1 + runStart], runLen);
-                    runLen = 0;
+                    flush();
                 }
             }
-            if (runLen != 0) to.registers(h.reg + runStart, &w[i + 1 + runStart], runLen);
+            if (runLen != 0) flush();
         } else {
             switch (h.opcode) {
             case pm4::kNop: case CP_WAIT_MEM_GTE: case CP_SKIP_IB2_ENABLE_GLOBAL: case CP_WAIT_FOR_IDLE: case CP_LOAD_STATE6_GEOM:
@@ -2754,10 +2781,13 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
                 forgot = true;
                 break;
             }
-            to.packet(h.opcode, h.count ? &w[i + 1] : nullptr, h.count);
+            // the packet as it was: its header and its words
+            memcpy(out, &w[i], 4ull * (1 + h.count));
+            out += 1 + h.count;
         }
         i += 1 + h.count;
     }
+    to.append(scratch.data(), size_t(out - scratch.data()));
     return forgot;
 }
 
@@ -2901,7 +2931,13 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         }
     }
     Piece passTable;
-    pm4::Stream head, body, headSys, bodySys;
+    // (sapphire) this thread's four, emptied: making and freeing them was a quarter of a draw's time on the phone
+    static thread_local pm4::Stream tlHead, tlBody, tlHeadSys, tlBodySys;
+    pm4::Stream &head = tlHead, &body = tlBody, &headSys = tlHeadSys, &bodySys = tlBodySys;
+    head.clear();
+    body.clear();
+    headSys.clear();
+    bodySys.clear();
     if (!joins) {
         if (!piece(render::kTableBytes, &passTable, &why)) {
             return fail(std::string("no memory for the pass's table: ") + why);
@@ -2926,7 +2962,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     // sample count and options are the last draw's in this pass: deduplication dropped every word of it anyway, and
     // making the words was most of a draw's encoding (some 190 of its 350). Not after a packet that made the
     // deduplication forget what the registers hold (staticKey emptied then).
-    std::vector<uint8_t> staticKey;
+    static thread_local std::vector<uint8_t> staticKey;
+    staticKey.clear();
     if (options.dedupRegs) {
         const void* ptrs[2] = {program.vs.k.words, program.fs.k.words};
         const uint32_t sizes[3] = {program.vs.k.numWords, program.fs.k.numWords, program.samples};
@@ -2987,7 +3024,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         open_->table = passTable.gpuAddress();
         if (dual) {
             appendDeduped(open_->sysStream, headSys, open_->regs);
-            open_->headGmem = std::move(head);
+            open_->headGmem = head;
         } else if (options.dedupRegs) {
             appendDeduped(stream_, head, open_->regs);
         } else {
@@ -3047,7 +3084,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     if (options.dedupRegs && open_->options.dedupRegs) {
         bool forgot = appendDeduped(into, body, open_->gmem ? open_->bodyRegs : open_->regs);
         if (open_->dual) forgot = appendDeduped(open_->sysStream, bodySys, open_->regs) || forgot;
-        open_->staticKey = forgot ? std::vector<uint8_t>() : std::move(staticKey);
+        if (forgot) open_->staticKey.clear(); else open_->staticKey = staticKey;   // (a copy: the thread keeps its buffer)
     } else {
         appendStream(into, body);
         if (open_->dual) appendStream(open_->sysStream, bodySys);

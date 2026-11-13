@@ -10,6 +10,15 @@
 
 #include "hakios-metal/gpu.hpp"
 
+// the kernel GPU service by name: hakios's HakiosGPU, sapphire's SapphireGPU (-DHAKIOS_GPU_SERVICE=\"SapphireGPU\")
+#ifndef HAKIOS_GPU_SERVICE
+#if defined(HAKIOS_CHIP_A610)
+#define HAKIOS_GPU_SERVICE "SapphireGPU"
+#else
+#define HAKIOS_GPU_SERVICE "HakiosGPU"
+#endif
+#endif
+
 namespace hakios::metal {
 
 namespace {
@@ -65,7 +74,7 @@ private:
 }  // namespace
 
 std::unique_ptr<Transport> openKernelGpu(std::string* why) {
-    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("HakiosGPU"));
+    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(HAKIOS_GPU_SERVICE));
     if (s == 0) {
         *why = "no HakiosGPU service: the kernel has not started the GPU (gpu=1, the firmware in fw-gpu/, the phone)";
         return nullptr;

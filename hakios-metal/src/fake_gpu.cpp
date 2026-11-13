@@ -1,5 +1,6 @@
 #include "hakios-metal/fake_gpu.hpp"
 
+#include <cstdlib>
 #include <cerrno>
 #include <cmath>
 #include <chrono>
@@ -269,6 +270,7 @@ uint8_t* FakeGpu::at(uint64_t iova, uint64_t length) {
 void FakeGpu::fault(const std::string& why) {
     stats_.faults++;
     stats_.lastFault = why;
+    if (getenv("FAKE_FAULTS")) fprintf(stderr, "FAKE FAULT: %s%c", why.c_str(), 10);
 }
 
 uint32_t FakeGpu::reg(uint32_t r) const {
@@ -663,15 +665,24 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
     uint32_t ctrl0 = reg(REG_A6XX_SP_CS_CTRL_REG0);
     uint32_t spThreads = fieldOf(ctrl0, A6XX_SP_CS_CTRL_REG0_THREADSIZE__MASK, A6XX_SP_CS_CTRL_REG0_THREADSIZE__SHIFT);
     uint32_t hlsqThreads = fieldOf(reg(REG_A6XX_HLSQ_CS_CNTL_1), A6XX_HLSQ_CS_CNTL_1_THREADSIZE__MASK, A6XX_HLSQ_CS_CNTL_1_THREADSIZE__SHIFT);
+    if (!kSupportsDoubleThreadsize) {
+        // (sapphire) a chip without double threadsize (the A610) reads the compute wave size from HLSQ_FS_CNTL_0 and
+        // wants THREAD128 in HLSQ_CS_CNTL_1 (fd6_compute.cc cs_program_emit)
+        // (and SP_CS_CTRL_REG0 too: fd6_program.cc fd6_emit_shader, MESA_SHADER_COMPUTE)
+        if (hlsqThreads != THREAD128 || spThreads != THREAD128) {
+            fault("HLSQ_CS_CNTL_1 and SP_CS_CTRL_REG0 are not THREAD128 on a chip without double threadsize");
+            return false;
+        }
+    }
     if (spThreads != hlsqThreads) {
         fault("SP_CS_CTRL_REG0 and HLSQ_CS_CNTL_1 disagree about the thread size");
         return false;
     }
-    if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
+    if (kHasLpac && (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1))) {
         fault("the HLSQ's and the SP's copies of the id registers (CS_CNTL_0, CS_CNTL_1) differ");
         return false;
     }
-    if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
+    if (kHasLpac && reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
         fault("SP_CS_CTRL_REG1 and HLSQ_CS_CTRL_REG1 differ about shared memory and the constant split");
         return false;
     }
