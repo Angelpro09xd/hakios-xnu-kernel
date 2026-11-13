@@ -3282,6 +3282,30 @@ hm_describe_function(id f)
 	{
 		hakios_metal_constant vsConstants[64], fsConstants[64];
 		unsigned vsCount = hm_function_constants(vs, vsConstants, 64), fsCount = hm_function_constants(fs, fsConstants, 64);
+		/* (sapphire, a diagnostic) metal_fc_off=N[:N...]: fragment function constants N forced to 0 (CoreAnimation's) */
+		{
+			static char list[128];
+			static int read;
+			if (!read) {
+				char args[1024] = "";
+				size_t size = sizeof(args) - 1;
+				const char *at;
+				read = 1;
+				if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_fc_off=")) != NULL) {
+					snprintf(list, sizeof(list), "%.*s", (int)strcspn(at + 13, " \n"), at + 13);
+				}
+			}
+			for (const char *q = list; *q != '\0';) {
+				unsigned idx = (unsigned)strtoul(q, (char **)&q, 10);
+				for (unsigned i = 0; i < fsCount; i++) {
+					if (fsConstants[i].index == idx && fsConstants[i].bits != 0) {
+						HM_ONCE("metal_fc_off: a fragment constant forced to 0\n");
+						fsConstants[i].bits = 0;
+					}
+				}
+				if (*q == ':') q++; else break;
+			}
+		}
 
 		program = hakios_metal_program_new_bitcode_constants([vsAir bytes], [vsAir length], vsConstants, vsCount, fsAir != nil ? [fsAir bytes] : NULL,
 								     fsAir != nil ? [fsAir length] : 0,
@@ -9175,7 +9199,7 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 			size_t size = sizeof(args) - 1;
 			on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_snap") != NULL;
 		}
-		if (on && snaps < 6 && _colorTexture != nil && [_colorTexture iosurface] == NULL) {
+		if (on && snaps < 6 && _colorTexture != nil) {   /* (surfaces too: the frame as drawn) */
 			FILE *f = fopen("/var/tmp/metal.snap", "r");
 			unsigned w = 0, h = 0;
 			if (f != NULL) {
