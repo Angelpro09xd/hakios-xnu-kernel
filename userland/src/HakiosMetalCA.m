@@ -5125,7 +5125,7 @@ HM_REFUSES_OUT_LOUD
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
 
-		if (!(hm_bootargs(args, &size) == 0 && strstr(args, "metal_defer=0") != NULL)) {   /* (sapphire: on by default since 11-13, scheduled handlers delivered after the submission; metal_defer=0 turns it off) */
+		if (hm_bootargs(args, &size) == 0 && strstr(args, "metal_defer=1") != NULL) {   /* (sapphire: off by default -- swipes gain (36-38 fps against 26-34) but an app opening stays black until touched, 11-13) */
 			hakios_metal_queue_set_deferred(_queue, 1);
 			HM_ONCE("command buffers recorded deferred, by a thread of hakios-metal's (metal_defer=1)\n");
 		}
