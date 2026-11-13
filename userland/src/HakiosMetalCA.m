@@ -1713,6 +1713,27 @@ hm_bitcode_for(id function, NSString *pipeline, BOOL vertex)
 	if (name == nil || ![name hasPrefix:@"fixed_"]) {
 		return own;
 	}
+	/*
+	 * (sapphire, after Martinvlba's akita-port 1d586fc3) metal_ca_generic: CoreAnimation's uber shaders as this phone's
+	 * own QuartzCore has them -- generic, with the function constants each pipeline sets (fc_color_opcodes0,
+	 * fc_color_inputs0, ...) -- compiled as they are with the pipeline's constants, for the pipelines the pipeline
+	 * library names and the ones CoreAnimation makes at run time alike. The library's variants stood in for those by
+	 * the "nearest" one (45 such stand-ins logged), which ignores their colour operations: frames drawn blue, red,
+	 * green or purple (testers' bugs 15, 18, 31).
+	 */
+	{
+		static int generic = -1;
+		if (generic < 0) {
+			char args[1024] = "";
+			size_t size = sizeof(args) - 1;
+			generic = !(hm_bootargs(args, &size) == 0 && strstr(args, "metal_ca_variants") != NULL);   /* (on by default since 11-13; metal_ca_variants: the old road) */
+			hm_print("CoreAnimation's uber shaders: %s\n", generic ? "GENERIC, this phone's own, specialised by each pipeline's "
+				 "constants (metal_ca_generic)" : "the pipeline library's variants (the nearest for a pipeline it does not name)");
+		}
+		if (generic) {
+			return own;
+		}
+	}
 	hm_ca_load();
 	if ([function respondsToSelector:@selector(label)]) {
 		label = [function label];
@@ -5104,7 +5125,7 @@ HM_REFUSES_OUT_LOUD
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
 
-		if (hm_bootargs(args, &size) == 0 && strstr(args, "metal_defer=1") != NULL) {   /* (sapphire: off by default -- uneven frames with it) */
+		if (!(hm_bootargs(args, &size) == 0 && strstr(args, "metal_defer=0") != NULL)) {   /* (sapphire: on by default since 11-13, scheduled handlers delivered after the submission; metal_defer=0 turns it off) */
 			hakios_metal_queue_set_deferred(_queue, 1);
 			HM_ONCE("command buffers recorded deferred, by a thread of hakios-metal's (metal_defer=1)\n");
 		}
@@ -6484,7 +6505,7 @@ hm_completed(hakios_metal_cb *cb, void *context)
 
 - (void)commit
 {
-	BOOL met = YES;
+	BOOL met = YES, waitFirst;
 
 	if (_committed) {
 		HM_ONCE("a command buffer was committed twice; Metal asserts on that, this plug-in does nothing the second time\n");
@@ -6513,6 +6534,8 @@ hm_completed(hakios_metal_cb *cb, void *context)
 			}
 			[waits release];
 			hakios_metal_cb_commit(_cb, hm_completed, self);
+			/* (metal_defer=1: the commit itself is queued; "sent" and "scheduled" mean submitted to the GPU) */
+			hakios_metal_cb_wait_scheduled(_cb);
 			dispatch_semaphore_signal(_sent);
 			[self hakiosDeliverScheduled];
 			[self release];
@@ -6524,6 +6547,36 @@ hm_completed(hakios_metal_cb *cb, void *context)
 
 		hakios_metal_cb_commit(_cb, hm_completed, self);
 		hm_fps_commit(hm_now() - began);
+	}
+	/*
+	 * metal_defer=1: the commit above was only queued for hakios-metal's recording thread. A scheduled handler is
+	 * where a window server hands the surface to the display, and the display waits only for submissions the kernel
+	 * has seen (MiniIOSurfaceDrawn): delivered before the submission, the panel showed frames the GPU had not drawn
+	 * yet -- black strips while anything moved, and the first Apple logo never shown. So with handlers waiting, the
+	 * submission comes first; a buffer with none goes on at once.
+	 */
+	@synchronized (self) {
+		waitFirst = [_scheduled count] != 0;
+	}
+	if (waitFirst) {
+		/*
+		 * (sapphire) not on the render thread: waiting here made metal_defer serial again (16-28 fps against 36-39).
+		 * The handlers -- the hand-over to the display -- are delivered by a serial queue of this plug-in's once the
+		 * submission has happened, in commit order; the render thread goes on with the next frame meanwhile.
+		 */
+		static dispatch_queue_t q;
+		static dispatch_once_t once;
+		dispatch_once(&once, ^{
+			dispatch_queue_attr_t a = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+			q = dispatch_queue_create("hakios-metal.scheduled", a);
+		});
+		[self retain];
+		dispatch_async(q, ^{
+			hakios_metal_cb_wait_scheduled(_cb);
+			[self hakiosDeliverScheduled];
+			[self release];
+		});
+		return;
 	}
 	[self hakiosDeliverScheduled];
 }
@@ -6543,8 +6596,16 @@ hm_completed(hakios_metal_cb *cb, void *context)
 	if (!_committed) {
 		HM_ONCE("a command buffer was waited on for scheduling before it was committed; Metal would wait for ever, "
 			"this plug-in returns\n");
+		return;
 	}
-	/* committed: hakios_metal_cb_commit returned with it scheduled, so there is nothing left to wait for */
+	if (_sent != NULL) {
+		/* a held commit: signalled once it has been submitted (passed on to the next waiter) */
+		dispatch_semaphore_wait(_sent, DISPATCH_TIME_FOREVER);
+		dispatch_semaphore_signal(_sent);
+		return;
+	}
+	/* submitted once its recording thread has come to the commit (metal_defer=1); at once otherwise */
+	hakios_metal_cb_wait_scheduled(_cb);
 }
 
 - (void)waitUntilCompleted
